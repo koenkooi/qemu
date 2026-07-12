@@ -49,6 +49,7 @@ config BEAGLEBONE
     default y
     depends on TCG && ARM
     select AM335X_INTC
+    select AM335X_TIMER
     select SERIAL_MM
     select UNIMP
 

@@ -36,18 +36,35 @@
 /* INTC input line numbers (TRM spruh73q ch.6) */
 #define AM335X_IRQ_UART0        72
 
+/* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20) */
+static const struct {
+    hwaddr addr;
+    unsigned int irq;
+} am335x_timer_table[AM335X_NUM_TIMERS] = {
+    { 0x44E05000, 66 }, /* DMTIMER0 */
+    { 0x44E31000, 67 }, /* DMTIMER1 (1ms, not modelled specially here) */
+    { 0x48040000, 68 }, /* DMTIMER2 */
+    { 0x48042000, 69 }, /* DMTIMER3 */
+};
+
 static void am335x_soc_init(Object *obj)
 {
     AM335xState *s = AM335X_SOC(obj);
+    int i;
 
     object_initialize_child(obj, "cpu", &s->cpu,
                             ARM_CPU_TYPE_NAME("cortex-a8"));
     object_initialize_child(obj, "intc", &s->intc, TYPE_AM335X_INTC);
+    for (i = 0; i < AM335X_NUM_TIMERS; i++) {
+        object_initialize_child(obj, "timer[*]", &s->timer[i],
+                                TYPE_AM335X_TIMER);
+    }
 }
 
 static void am335x_soc_realize(DeviceState *dev, Error **errp)
 {
     AM335xState *s = AM335X_SOC(dev);
+    int i;
 
     if (!qdev_realize(DEVICE(&s->cpu), NULL, errp)) {
         return;
@@ -80,19 +97,28 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                    AM335X_UART0_CLK / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
+    /* DMTIMER0..3: real devices, needed for the kernel clockevent/
+     * clocksource to make progress past time init. */
+    for (i = 0; i < AM335X_NUM_TIMERS; i++) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer[i]), 0,
+                        am335x_timer_table[i].addr);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer[i]), 0,
+                           qdev_get_gpio_in(dev, am335x_timer_table[i].irq));
+    }
+
     /*
      * Placeholders for peripherals that become real devices in later
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
      */
     create_unimplemented_device("l4_wkup-prcm",    0x44E00000, 0x2000);
-    create_unimplemented_device("dmtimer0",        0x44E05000, 0x1000);
     create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
     create_unimplemented_device("l4_wkup-control", 0x44E10000, 0x20000);
-    create_unimplemented_device("dmtimer1",        0x44E31000, 0x1000);
     create_unimplemented_device("wdt1",            0x44E35000, 0x1000);
-    create_unimplemented_device("dmtimer2",        0x48040000, 0x1000);
     create_unimplemented_device("mmc0",            0x48060000, 0x1000);
     create_unimplemented_device("mmc1",            0x481D8000, 0x10000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);

@@ -1,3 +1,7 @@
+config AM335X_TIMER
+    bool
+    select PTIMER
+
 config ARM_TIMER
     bool
     select PTIMER
