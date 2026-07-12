@@ -20,6 +20,7 @@
 #include "hw/qdev-core.h"
 #include "exec/memory.h"
 #include "target/arm/cpu.h"
+#include "hw/intc/am335x_intc.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -31,6 +32,7 @@ struct AM335xState {
     /*< public >*/
 
     ARMCPU cpu;
+    AM335xIntcState intc;
     MemoryRegion ocmc;
 };
 

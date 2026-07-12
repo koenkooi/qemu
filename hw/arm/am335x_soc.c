@@ -33,12 +33,16 @@
 #define AM335X_UART0_BASE       0x44E09000
 #define AM335X_UART0_CLK        48000000
 
+/* INTC input line numbers (TRM spruh73q ch.6) */
+#define AM335X_IRQ_UART0        72
+
 static void am335x_soc_init(Object *obj)
 {
     AM335xState *s = AM335X_SOC(obj);
 
     object_initialize_child(obj, "cpu", &s->cpu,
                             ARM_CPU_TYPE_NAME("cortex-a8"));
+    object_initialize_child(obj, "intc", &s->intc, TYPE_AM335X_INTC);
 }
 
 static void am335x_soc_realize(DeviceState *dev, Error **errp)
@@ -55,14 +59,25 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(get_system_memory(), AM335X_OCMC_BASE,
                                 &s->ocmc);
 
+    /* MPU interrupt controller (INTCPS) @ 0x48200000, out 0 = IRQ, 1 = FIQ. */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->intc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->intc), 0, 0x48200000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->intc), 0,
+                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->intc), 1,
+                       qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_FIQ));
+    /* Re-export the 128 INTC input lines on the SoC container. */
+    qdev_pass_gpios(DEVICE(&s->intc), dev, NULL);
+
     /*
-     * UART0. No interrupt controller is modelled yet in M1, so pass a NULL
-     * qemu_irq; qemu_set_irq(NULL, ...) is a documented no-op.
-     *
+     * UART0 (16550-compatible), IRQ line 72 on the INTC.
      * FIXME use a qdev chardev prop instead of serial_hd()
      */
     serial_mm_init(get_system_memory(), AM335X_UART0_BASE, 2,
-                   NULL, AM335X_UART0_CLK / 16, serial_hd(0),
+                   qdev_get_gpio_in(dev, AM335X_IRQ_UART0),
+                   AM335X_UART0_CLK / 16, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
 
     /*
@@ -79,7 +94,6 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("wdt1",            0x44E35000, 0x1000);
     create_unimplemented_device("dmtimer2",        0x48040000, 0x1000);
     create_unimplemented_device("mmc0",            0x48060000, 0x1000);
-    create_unimplemented_device("intc",            0x48200000, 0x1000);
     create_unimplemented_device("mmc1",            0x481D8000, 0x10000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
 }
