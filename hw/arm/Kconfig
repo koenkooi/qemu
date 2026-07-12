@@ -44,6 +44,13 @@ config CUBIEBOARD
     depends on TCG && ARM
     select ALLWINNER_A10
 
+config BEAGLEBONE
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+    select UNIMP
+
 config DIGIC
     bool
     default y
