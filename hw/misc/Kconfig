@@ -56,6 +56,9 @@ config AM335X_WDT
 config AM335X_CONTROL
     bool
 
+config AM335X_USBSS
+    bool
+
 config TPS65217_PMU
     bool
     depends on I2C
