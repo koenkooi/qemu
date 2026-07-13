@@ -28,7 +28,10 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/ptimer.h"
+#include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/host-utils.h"
 #include "migration/vmstate.h"
 
 /* TCLR bits */
@@ -45,8 +48,17 @@
 #define IRQ_TCAR     (1 << 2)
 #define IRQ_MASK     (IRQ_MAT | IRQ_OVF | IRQ_TCAR)
 
-/* TIOCP_CFG bits */
-#define TIOCP_CFG_SOFTRESET (1 << 0)
+/*
+ * TIOCP_CFG (SYSCONFIG) SOFTRESET bit. Its position depends on the timer
+ * variant's OCP wrapper:
+ *  - Regular DMTIMER ("ti,am335x-timer", OMAP4-style sysc): bit 0.
+ *  - 1ms DMTIMER1    ("ti,am335x-timer-1ms", OMAP2-style sysc): bit 1;
+ *    for that variant bit 0 is AUTOIDLE, so misreading it as SOFTRESET
+ *    resets the always-on clocksource whenever the kernel enables
+ *    autoidle, stopping the free-running counter (see s->one_ms).
+ */
+#define TIOCP_CFG_SOFTRESET_OMAP4 (1 << 0)
+#define TIOCP_CFG_SOFTRESET_OMAP2 (1 << 1)
 
 /* TISTAT bits */
 #define TISTAT_RESETDONE (1 << 0)
@@ -80,13 +92,58 @@ static uint64_t am335x_timer_limit(AM335xTimerState *s)
     return 0x100000000ULL - s->tldr;
 }
 
-/* Read back the guest-visible 32-bit up-counter from the internal
- * down-counting ptimer ("ticks remaining until overflow"). */
+/* Effective functional-clock rate (Hz), honouring the PTV/PRE prescaler. */
+static uint32_t am335x_timer_freq(AM335xTimerState *s)
+{
+    uint32_t freq = AM335X_TIMER_FREQ;
+
+    if (s->tclr & TCLR_PRE) {
+        uint32_t ptv = (s->tclr & TCLR_PTV_MASK) >> TCLR_PTV_SHIFT;
+        freq >>= (ptv + 1);
+        if (freq == 0) {
+            freq = 1;
+        }
+    }
+    return freq;
+}
+
+/*
+ * Guest-visible 32-bit up-counter (TCRR), computed directly from
+ * QEMU_CLOCK_VIRTUAL. The counter runs over [TLDR, 0x100000000) and
+ * reloads to TLDR on overflow, so it advances modulo (0x100000000 - TLDR)
+ * from its base. Deriving it from the virtual clock (rather than reading
+ * back the internal ptimer's down-counter) is what lets the free-running
+ * clocksource use case wrap cleanly and indefinitely through 2^32; the
+ * ptimer's periodic reload cannot service a 2^32-tick period, which
+ * previously left ktime/sched_clock frozen at the first wrap (~179s).
+ */
 static uint32_t am335x_timer_get_tcrr(AM335xTimerState *s)
 {
-    uint64_t count = ptimer_get_count(s->timer);
+    uint64_t elapsed, span;
+    int64_t off, now;
 
-    return (uint32_t)(0x100000000ULL - count);
+    if (!(s->tclr & TCLR_ST)) {
+        /* Stopped: the counter holds its last value. */
+        return s->base_tcrr;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    elapsed = muldiv64(now - s->base_time, am335x_timer_freq(s),
+                       NANOSECONDS_PER_SECOND);
+
+    span = 0x100000000ULL - s->tldr;
+    off = (int64_t)s->base_tcrr - (int64_t)s->tldr;
+    if (off < 0) {
+        off += span;
+    }
+    return s->tldr + (uint32_t)(((uint64_t)off + elapsed) % span);
+}
+
+/* Re-base the virtual-clock counter so that TCRR == tcrr as of now. */
+static void am335x_timer_rebase(AM335xTimerState *s, uint32_t tcrr)
+{
+    s->base_tcrr = tcrr;
+    s->base_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
 static void am335x_timer_update_irq(AM335xTimerState *s)
@@ -99,19 +156,7 @@ static void am335x_timer_update_irq(AM335xTimerState *s)
 /* Must be called from within a ptimer_transaction_begin/commit block. */
 static void am335x_timer_update_freq(AM335xTimerState *s)
 {
-    uint32_t freq = AM335X_TIMER_FREQ;
-
-    /* Prescaler support (PTV/PRE) is optional for this model; the
-     * kernel's periodic tick only needs a working overflow interrupt,
-     * not a bit-accurate rate, so we simply honor it when enabled. */
-    if (s->tclr & TCLR_PRE) {
-        uint32_t ptv = (s->tclr & TCLR_PTV_MASK) >> TCLR_PTV_SHIFT;
-        freq >>= (ptv + 1);
-        if (freq == 0) {
-            freq = 1;
-        }
-    }
-    ptimer_set_freq(s->timer, freq);
+    ptimer_set_freq(s->timer, am335x_timer_freq(s));
 }
 
 /* ptimer expiry callback: the up-counter has overflowed past
@@ -122,13 +167,14 @@ static void am335x_timer_tick(void *opaque)
 
     s->irqstatus_raw |= IRQ_OVF;
 
+    /* The up-counter has just overflowed and reloaded from TLDR; re-base
+     * the virtual-clock counter to match. */
+    am335x_timer_rebase(s, s->tldr);
+
     if (!(s->tclr & TCLR_AR)) {
         /* Hardware clears ST and stops counting when AR is not set. */
         s->tclr &= ~TCLR_ST;
     }
-    /* When AR is set the ptimer is already running periodic and has
-     * auto-reloaded its down-counter from "limit", which corresponds
-     * to TCRR reloading from TLDR. */
 
     am335x_timer_update_irq(s);
 }
@@ -153,6 +199,9 @@ static void am335x_timer_reset_hold(AM335xTimerState *s)
     ptimer_set_limit(s->timer, am335x_timer_limit(s), 1);
     ptimer_transaction_commit(s->timer);
 
+    /* Counter stopped (TCLR.ST clear) and reads back 0. */
+    am335x_timer_rebase(s, 0);
+
     am335x_timer_update_irq(s);
 }
 
@@ -166,12 +215,20 @@ static void am335x_timer_dev_reset(DeviceState *dev)
 
 static void am335x_timer_write_tclr(AM335xTimerState *s, uint32_t value)
 {
+    /* Snapshot the counter under the old control settings, then re-base so
+     * the new settings (start/stop, prescaler) take effect from now. */
+    uint32_t cur = am335x_timer_get_tcrr(s);
+
     s->tclr = value;
+    am335x_timer_rebase(s, cur);
 
     ptimer_transaction_begin(s->timer);
     am335x_timer_update_freq(s);
     ptimer_set_limit(s->timer, am335x_timer_limit(s), 0);
     if (s->tclr & TCLR_ST) {
+        /* Arm the ptimer's overflow at (0x100000000 - cur) ticks so the
+         * OVF interrupt still fires at the counter wrap. */
+        ptimer_set_count(s->timer, 0x100000000ULL - cur);
         ptimer_run(s->timer, (s->tclr & TCLR_AR) ? 0 : 1);
     } else {
         ptimer_stop(s->timer);
@@ -181,11 +238,15 @@ static void am335x_timer_write_tclr(AM335xTimerState *s, uint32_t value)
 
 static void am335x_timer_write_tldr(AM335xTimerState *s, uint32_t value)
 {
-    s->tldr = value;
+    /* Writing TLDR alone does not reload TCRR; the new reload value only
+     * takes effect on the next overflow (if AR is set) or an explicit
+     * TTGR write. Preserve the current counter value across the change of
+     * reload/period by snapshotting and re-basing. */
+    uint32_t cur = am335x_timer_get_tcrr(s);
 
-    /* Writing TLDR alone does not reload TCRR; the new reload value
-     * only takes effect on the next overflow (if AR is set) or an
-     * explicit TTGR write. */
+    s->tldr = value;
+    am335x_timer_rebase(s, cur);
+
     ptimer_transaction_begin(s->timer);
     ptimer_set_limit(s->timer, am335x_timer_limit(s), 0);
     ptimer_transaction_commit(s->timer);
@@ -193,6 +254,8 @@ static void am335x_timer_write_tldr(AM335xTimerState *s, uint32_t value)
 
 static void am335x_timer_write_tcrr(AM335xTimerState *s, uint32_t value)
 {
+    am335x_timer_rebase(s, value);
+
     ptimer_transaction_begin(s->timer);
     ptimer_set_count(s->timer, 0x100000000ULL - value);
     ptimer_transaction_commit(s->timer);
@@ -201,6 +264,8 @@ static void am335x_timer_write_tcrr(AM335xTimerState *s, uint32_t value)
 static void am335x_timer_write_ttgr(AM335xTimerState *s, uint32_t value)
 {
     /* Any write triggers an immediate reload of TCRR from TLDR. */
+    am335x_timer_rebase(s, s->tldr);
+
     ptimer_transaction_begin(s->timer);
     ptimer_set_count(s->timer, am335x_timer_limit(s));
     ptimer_transaction_commit(s->timer);
@@ -208,11 +273,14 @@ static void am335x_timer_write_ttgr(AM335xTimerState *s, uint32_t value)
 
 static void am335x_timer_write_tiocp_cfg(AM335xTimerState *s, uint32_t value)
 {
-    if (value & TIOCP_CFG_SOFTRESET) {
+    uint32_t softreset = s->one_ms ? TIOCP_CFG_SOFTRESET_OMAP2
+                                   : TIOCP_CFG_SOFTRESET_OMAP4;
+
+    if (value & softreset) {
         /* SOFTRESET is self-clearing; the rest of TIOCP_CFG survives
          * a soft reset in real hardware, but the timer's functional
          * state does not. */
-        s->tiocp_cfg = value & ~TIOCP_CFG_SOFTRESET;
+        s->tiocp_cfg = value & ~softreset;
         am335x_timer_reset_hold(s);
     } else {
         s->tiocp_cfg = value;
@@ -370,6 +438,8 @@ static const VMStateDescription am335x_timer_vmstate = {
         VMSTATE_UINT32(tcar1, AM335xTimerState),
         VMSTATE_UINT32(tcar2, AM335xTimerState),
         VMSTATE_UINT32(tsicr, AM335xTimerState),
+        VMSTATE_INT64(base_time, AM335xTimerState),
+        VMSTATE_UINT32(base_tcrr, AM335xTimerState),
         VMSTATE_PTIMER(timer, AM335xTimerState),
         VMSTATE_END_OF_LIST()
     }
@@ -407,6 +477,10 @@ static void am335x_timer_realize(DeviceState *dev, Error **errp)
     ptimer_transaction_commit(s->timer);
 }
 
+static const Property am335x_timer_properties[] = {
+    DEFINE_PROP_BOOL("one-ms", AM335xTimerState, one_ms, false),
+};
+
 static void am335x_timer_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -414,6 +488,7 @@ static void am335x_timer_class_init(ObjectClass *klass, void *data)
     dc->realize = am335x_timer_realize;
     device_class_set_legacy_reset(dc, am335x_timer_dev_reset);
     dc->vmsd = &am335x_timer_vmstate;
+    device_class_set_props(dc, am335x_timer_properties);
     dc->desc = "TI AM335x DMTIMER";
 }
 
