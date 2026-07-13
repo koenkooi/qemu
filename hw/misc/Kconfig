@@ -47,6 +47,9 @@ config A9SCU
 config ARM11SCU
     bool
 
+config AM335X_PRCM
+    bool
+
 config MOS6522
     bool
 

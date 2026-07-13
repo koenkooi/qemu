@@ -50,6 +50,7 @@ config BEAGLEBONE
     depends on TCG && ARM
     select AM335X_INTC
     select AM335X_TIMER
+    select AM335X_PRCM
     select SERIAL_MM
     select UNIMP
 

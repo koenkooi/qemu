@@ -59,6 +59,7 @@ static void am335x_soc_init(Object *obj)
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_AM335X_TIMER);
     }
+    object_initialize_child(obj, "prcm", &s->prcm, TYPE_AM335X_PRCM);
 }
 
 static void am335x_soc_realize(DeviceState *dev, Error **errp)
@@ -110,11 +111,20 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * Clock Module / PRCM @ 0x44E00000. Needed so ti-sysc can enable
+     * module functional clocks (CLKCTRL IDLEST) and DPLLs report locked,
+     * which unblocks the DMTIMER probes above.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->prcm), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->prcm), 0, 0x44E00000);
+
+    /*
      * Placeholders for peripherals that become real devices in later
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
      */
-    create_unimplemented_device("l4_wkup-prcm",    0x44E00000, 0x2000);
     create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
     create_unimplemented_device("l4_wkup-control", 0x44E10000, 0x20000);

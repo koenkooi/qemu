@@ -22,6 +22,7 @@
 #include "target/arm/cpu.h"
 #include "hw/intc/am335x_intc.h"
 #include "hw/timer/am335x_timer.h"
+#include "hw/misc/am335x_prcm.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -37,6 +38,7 @@ struct AM335xState {
     ARMCPU cpu;
     AM335xIntcState intc;
     AM335xTimerState timer[AM335X_NUM_TIMERS];
+    AM335xPrcmState prcm;
     MemoryRegion ocmc;
 };
 
