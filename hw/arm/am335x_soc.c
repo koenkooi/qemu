@@ -183,8 +183,11 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
      * MMIO is logged instead of aborting the machine.
      */
     create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
+    create_unimplemented_device("tscadc",          0x44E0D000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
     create_unimplemented_device("l4_wkup-control", 0x44E10000, 0x20000);
+    create_unimplemented_device("rtc",             0x44E3E000, 0x1000);
+    create_unimplemented_device("counter32k",      0x44E86000, 0x1000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
 }
 
