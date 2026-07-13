@@ -50,6 +50,9 @@ config ARM11SCU
 config AM335X_PRCM
     bool
 
+config AM335X_WDT
+    bool
+
 config MOS6522
     bool
 
