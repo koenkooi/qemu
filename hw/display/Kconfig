@@ -29,6 +29,11 @@ config AM335X_LCDC
     bool
     select FRAMEBUFFER
 
+config TDA19988
+    bool
+    depends on I2C
+    select EDID
+
 config SII9022
     bool
     depends on I2C
