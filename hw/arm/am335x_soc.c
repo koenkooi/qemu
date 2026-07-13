@@ -69,6 +69,22 @@ static const struct {
     { 0x481D8000, 28 }, /* MMC1 -> mmcblk1 */
 };
 
+/* GPIO0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/25;
+ * DT interrupts 96/98/32/62 in am33xx-l4.dtsi). datain_reset seeds the
+ * static input level: GPIO0 line 6 is the microSD card-detect
+ * (cd-gpios = <&gpio0 6 GPIO_ACTIVE_LOW>), so leaving it low (0) reports a
+ * card present. */
+static const struct {
+    hwaddr addr;
+    unsigned int irq;
+    uint32_t datain_reset;
+} am335x_gpio_table[AM335X_NUM_GPIO] = {
+    { 0x44E07000, 96, 0 }, /* GPIO0 (microSD card-detect on line 6) */
+    { 0x4804C000, 98, 0 }, /* GPIO1 (USR LEDs 21-24) */
+    { 0x481AC000, 32, 0 }, /* GPIO2 */
+    { 0x481AE000, 62, 0 }, /* GPIO3 */
+};
+
 static void am335x_soc_init(Object *obj)
 {
     AM335xState *s = AM335X_SOC(obj);
@@ -84,6 +100,10 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "prcm", &s->prcm, TYPE_AM335X_PRCM);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_AM335X_WDT);
     object_initialize_child(obj, "control", &s->control, TYPE_AM335X_CONTROL);
+    for (i = 0; i < AM335X_NUM_GPIO; i++) {
+        object_initialize_child(obj, "gpio[*]", &s->gpio[i],
+                                TYPE_AM335X_GPIO);
+    }
     for (i = 0; i < AM335X_NUM_MMC; i++) {
         object_initialize_child(obj, "mmc[*]", &s->mmc[i],
                                 TYPE_AM335X_HSMMC);
@@ -185,6 +205,24 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->control), 0, 0x44E10000);
 
     /*
+     * GPIO0..3. GPIO0's card-detect input (line 6) gates the microSD
+     * controller's probe, so this must be a real device rather than an
+     * unimplemented stub. The per-line outputs are also where on-board
+     * LEDs (GPIO1) will attach.
+     */
+    for (i = 0; i < AM335X_NUM_GPIO; i++) {
+        qdev_prop_set_uint32(DEVICE(&s->gpio[i]), "datain-reset",
+                             am335x_gpio_table[i].datain_reset);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio[i]), 0,
+                        am335x_gpio_table[i].addr);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio[i]), 0,
+                           qdev_get_gpio_in(dev, am335x_gpio_table[i].irq));
+    }
+
+    /*
      * MMCHS0/1 (SDHCI behind a TI wrapper). Needed so the guest can mount a
      * rootfs from an SD image. The board attaches the actual SD cards to
      * each controller's "sd-bus".
@@ -204,7 +242,6 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
      */
-    create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
     create_unimplemented_device("tscadc",          0x44E0D000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
     create_unimplemented_device("rtc",             0x44E3E000, 0x1000);

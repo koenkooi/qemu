@@ -25,6 +25,7 @@
 #include "hw/misc/am335x_prcm.h"
 #include "hw/misc/am335x_wdt.h"
 #include "hw/misc/am335x_control.h"
+#include "hw/gpio/am335x_gpio.h"
 #include "hw/sd/am335x_hsmmc.h"
 #include "hw/char/am335x_uart.h"
 #include "qom/object.h"
@@ -34,6 +35,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AM335xState, AM335X_SOC)
 
 #define AM335X_NUM_TIMERS 4
 #define AM335X_NUM_MMC    2
+#define AM335X_NUM_GPIO   4
 
 struct AM335xState {
     /*< private >*/
@@ -46,6 +48,7 @@ struct AM335xState {
     AM335xPrcmState prcm;
     AM335xWdtState wdt;
     AM335xControlState control;
+    AM335xGpioState gpio[AM335X_NUM_GPIO];
     AM335xHsmmcState mmc[AM335X_NUM_MMC];
     AM335xUartState uart0;
     MemoryRegion ocmc;
