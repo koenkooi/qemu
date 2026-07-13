@@ -184,6 +184,19 @@ static void am335x_hsmmc_realize(DeviceState *dev, Error **errp)
                                   errp)) {
         return;
     }
+    /*
+     * The MMCHS SD_HCTL.SDBP (SD bus power) bit is a sticky software-
+     * controlled bit: once the sdhci-omap driver's conf_bus_power() writes it
+     * (with SD_HCTL.SDVS selecting 3.3 V) it must read back set, independent
+     * of the SD-standard card-present/voltage-capability gating the generic
+     * core applies (TRM spruh73q ch.18, SD_HCTL). Without this the driver's
+     * 1ms read-back poll times out and sdhci_omap_start_signal_voltage_switch
+     * WARNs on every mmc_power_up and runtime-PM resume.
+     */
+    if (!object_property_set_bool(OBJECT(&s->sdhci), "power-on-sticky", true,
+                                  errp)) {
+        return;
+    }
     if (!sysbus_realize(sbd_sdhci, errp)) {
         return;
     }

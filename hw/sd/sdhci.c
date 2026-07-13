@@ -1280,8 +1280,22 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         MASKED_WRITE(s->hostctl1, mask, value);
         MASKED_WRITE(s->pwrcon, mask >> 8, value >> 8);
         MASKED_WRITE(s->wakcon, mask >> 24, value >> 24);
-        if (!(s->prnsts & SDHC_CARD_PRESENT) || ((s->pwrcon >> 1) & 0x7) < 5 ||
-                !(s->capareg & (1 << (31 - ((s->pwrcon >> 1) & 0x7))))) {
+        /*
+         * The SD Host Standard only asserts SD Bus Power when a card is
+         * present and the selected bus voltage is one the controller
+         * advertises in CAPAB; otherwise the host is required to force
+         * SDHC_POWER_ON back to 0. The TI AM335x MMCHS instead treats
+         * SD_HCTL.SDBP (SD bus power) as a plain software-controlled bit
+         * that reads back whatever was written and is not gated on card
+         * detect (TRM spruh73q ch.18.4.1.2, SD_HCTL SDBP field). The
+         * sdhci-omap driver relies on that: conf_bus_power() writes SDBP
+         * and then polls up to 1ms for it to read back set, so a controller
+         * that clears it makes the poll time out and WARN. Honour the
+         * written POWER_ON bit when power_on_sticky is set.
+         */
+        if (!s->power_on_sticky &&
+            (!(s->prnsts & SDHC_CARD_PRESENT) || ((s->pwrcon >> 1) & 0x7) < 5 ||
+             !(s->capareg & (1 << (31 - ((s->pwrcon >> 1) & 0x7)))))) {
             s->pwrcon &= ~SDHC_POWER_ON;
         }
         break;

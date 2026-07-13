@@ -109,6 +109,16 @@ struct SDHCIState {
      */
     bool r2_has_crc;
     /*
+     * The SD Host Standard forces the Power Control SDHC_POWER_ON bit back
+     * to 0 unless a card is present and the selected bus voltage is one the
+     * controller advertises. The TI AM335x MMCHS (behind sdhci-omap) instead
+     * treats SD_HCTL.SDBP (SD bus power) as a sticky software-controlled bit
+     * that reads back whatever was written; sdhci-omap's conf_bus_power()
+     * writes it and polls for the read-back. Set this so POWER_ON honours the
+     * written value instead of being cleared by the presence/voltage checks.
+     */
+    bool power_on_sticky;
+    /*
      * Write Protect pin default active low for detecting SD card
      * to be protected. Set wp_inverted to invert the signal.
      */
