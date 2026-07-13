@@ -17,6 +17,7 @@ system_ss.add(when: 'CONFIG_ARM11SCU', if_true: files('arm11scu.c'))
 system_ss.add(when: 'CONFIG_AM335X_PRCM', if_true: files('am335x_prcm.c'))
 system_ss.add(when: 'CONFIG_AM335X_WDT', if_true: files('am335x_wdt.c'))
 system_ss.add(when: 'CONFIG_AM335X_CONTROL', if_true: files('am335x_control.c'))
+system_ss.add(when: 'CONFIG_TPS65217_PMU', if_true: files('tps65217.c'))
 
 system_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('armv7m_ras.c'))
 
