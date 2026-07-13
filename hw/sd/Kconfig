@@ -23,3 +23,8 @@ config SDHCI_PCI
 config CADENCE_SDHCI
     bool
     select SDHCI
+
+config AM335X_HSMMC
+    bool
+    select SDHCI
+    select SD
