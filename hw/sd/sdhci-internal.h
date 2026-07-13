@@ -312,6 +312,7 @@ extern const VMStateDescription sdhci_vmstate;
     DEFINE_PROP_UINT8("sd-spec-version", _state, sd_spec_version, 2), \
     DEFINE_PROP_UINT8("uhs", _state, uhs_mode, UHS_NOT_SUPPORTED), \
     DEFINE_PROP_UINT8("vendor", _state, vendor, SDHCI_VENDOR_NONE), \
+    DEFINE_PROP_BOOL("r2-has-crc", _state, r2_has_crc, false), \
     \
     /* Capabilities registers provide information on supported
      * features of this specific host controller implementation */ \

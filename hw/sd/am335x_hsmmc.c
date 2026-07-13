@@ -171,6 +171,19 @@ static void am335x_hsmmc_realize(DeviceState *dev, Error **errp)
                                   AM335X_HSMMC_CAPAB, errp)) {
         return;
     }
+    /*
+     * The MMCHS latches the whole 136-bit R2 response, CRC7 included, into
+     * SD_RSP10..76 rather than dropping the CRC and right-justifying the
+     * payload the way the SD Host Standard specifies (TRM spruh73q ch.18,
+     * SD_RSP* description). The Linux sdhci-omap driver reflects this with
+     * SDHCI_QUIRK2_RSP_136_HAS_CRC and reads the registers without the usual
+     * 8-bit realignment, so the embedded core must present R2 in that form or
+     * every CID/CSD field the guest decodes is off by one byte.
+     */
+    if (!object_property_set_bool(OBJECT(&s->sdhci), "r2-has-crc", true,
+                                  errp)) {
+        return;
+    }
     if (!sysbus_realize(sbd_sdhci, errp)) {
         return;
     }

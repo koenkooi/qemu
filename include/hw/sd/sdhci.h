@@ -101,6 +101,14 @@ struct SDHCIState {
     uint8_t uhs_mode;
     uint8_t vendor;        /* For vendor specific functionality */
     /*
+     * Some controllers (e.g. the TI MMCHS behind sdhci-omap, which sets
+     * SDHCI_QUIRK2_RSP_136_HAS_CRC) latch the whole 136-bit R2 response --
+     * including the trailing CRC7 -- into the response registers instead of
+     * the SD-Host-Standard layout that drops the CRC and right-justifies the
+     * 120 payload bits. Set this to present R2 in that "CRC retained" form.
+     */
+    bool r2_has_crc;
+    /*
      * Write Protect pin default active low for detecting SD card
      * to be protected. Set wp_inverted to invert the signal.
      */

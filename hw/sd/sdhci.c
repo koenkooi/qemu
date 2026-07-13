@@ -354,11 +354,25 @@ static void sdhci_send_command(SDHCIState *s)
             s->rspreg[1] = s->rspreg[2] = s->rspreg[3] = 0;
             trace_sdhci_response4(s->rspreg[0]);
         } else if (rlen == 16) {
-            s->rspreg[0] = ldl_be_p(&response[11]);
-            s->rspreg[1] = ldl_be_p(&response[7]);
-            s->rspreg[2] = ldl_be_p(&response[3]);
-            s->rspreg[3] = (response[0] << 16) | (response[1] << 8) |
-                            response[2];
+            if (s->r2_has_crc) {
+                /*
+                 * Controller keeps the trailing CRC7 in the response, so the
+                 * full 128 bits (CID/CSD[127:0], with the CRC in the low byte)
+                 * land left-justified across RESP[3..0]. The guest driver
+                 * (RSP_136_HAS_CRC) reads the registers verbatim, without the
+                 * SD-Host-Standard 8-bit realignment.
+                 */
+                s->rspreg[0] = ldl_be_p(&response[12]);
+                s->rspreg[1] = ldl_be_p(&response[8]);
+                s->rspreg[2] = ldl_be_p(&response[4]);
+                s->rspreg[3] = ldl_be_p(&response[0]);
+            } else {
+                s->rspreg[0] = ldl_be_p(&response[11]);
+                s->rspreg[1] = ldl_be_p(&response[7]);
+                s->rspreg[2] = ldl_be_p(&response[3]);
+                s->rspreg[3] = (response[0] << 16) | (response[1] << 8) |
+                                response[2];
+            }
             trace_sdhci_response16(s->rspreg[3], s->rspreg[2],
                                    s->rspreg[1], s->rspreg[0]);
         } else {
