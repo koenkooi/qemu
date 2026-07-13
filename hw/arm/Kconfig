@@ -56,6 +56,7 @@ config BEAGLEBONE
     select AM335X_GPIO
     select AM335X_HSMMC
     select AM335X_UART
+    select LED
     select UNIMP
 
 config DIGIC

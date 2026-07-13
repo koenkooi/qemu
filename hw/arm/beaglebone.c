@@ -23,8 +23,16 @@
 #include "hw/arm/boot.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
+#include "hw/misc/led.h"
 #include "system/blockdev.h"
 #include "exec/address-spaces.h"
+
+/* On-board USR LED descriptions, keyed by GPIO1 line 21..24. These strings
+ * are the identifiers a host relay matches to drive the board UI. */
+static const char * const bbb_usr_led_desc[4] = {
+    "beaglebone-usr0", "beaglebone-usr1",
+    "beaglebone-usr2", "beaglebone-usr3",
+};
 
 static struct arm_boot_info bbb_binfo = {
     .loader_start = 0x80000000,
@@ -74,6 +82,25 @@ static void beaglebone_init(MachineState *machine)
                                qdev_get_child_bus(DEVICE(&soc->mmc[i]),
                                                   "sd-bus"),
                                &error_fatal);
+    }
+
+    /*
+     * On-board LEDs. The four blue USR LEDs (USR0..3) are active-high and
+     * driven by GPIO1_21..24 (the am335x-gpio model exports those lines as
+     * qemu_irq outputs); the Linux leds-gpio driver blinks them via the
+     * heartbeat/mmc/cpu triggers. The green power LED has no GPIO -- it is on
+     * whenever the board is powered (active-high resets to on). TYPE_LED
+     * emits a led_change_intensity trace event per change, which a host relay
+     * forwards to the board UI keyed on these descriptions.
+     */
+    led_create_simple(OBJECT(machine), GPIO_POLARITY_ACTIVE_HIGH,
+                      LED_COLOR_GREEN, "beaglebone-power");
+    for (i = 0; i < 4; i++) {
+        LEDState *led = led_create_simple(OBJECT(machine),
+                                          GPIO_POLARITY_ACTIVE_HIGH,
+                                          LED_COLOR_BLUE, bbb_usr_led_desc[i]);
+        qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 21 + i,
+                              qdev_get_gpio_in(DEVICE(led), 0));
     }
 
     memory_region_add_subregion(get_system_memory(), 0x80000000,
