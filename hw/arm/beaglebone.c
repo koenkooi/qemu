@@ -21,6 +21,9 @@
 #include "hw/boards.h"
 #include "hw/arm/am335x_soc.h"
 #include "hw/arm/boot.h"
+#include "hw/qdev-properties.h"
+#include "hw/sd/sd.h"
+#include "system/blockdev.h"
 #include "exec/address-spaces.h"
 
 static struct arm_boot_info bbb_binfo = {
@@ -31,6 +34,7 @@ static struct arm_boot_info bbb_binfo = {
 static void beaglebone_init(MachineState *machine)
 {
     AM335xState *soc;
+    int i;
 
     /* BIOS is not supported by this board */
     if (machine->firmware) {
@@ -43,6 +47,27 @@ static void beaglebone_init(MachineState *machine)
     object_unref(OBJECT(soc));
 
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
+
+    /*
+     * Attach SD/MMC cards from -sd (first IF_SD drive -> MMC0 -> mmcblk0,
+     * second -> MMC1 -> mmcblk1). Which drive backs which controller is a
+     * board-level policy, so the wiring lives here rather than in the SoC.
+     */
+    for (i = 0; i < AM335X_NUM_MMC; i++) {
+        DriveInfo *di = drive_get(IF_SD, 0, i);
+        BlockBackend *blk = di ? blk_by_legacy_dinfo(di) : NULL;
+        DeviceState *carddev;
+
+        if (!blk) {
+            continue;
+        }
+        carddev = qdev_new(TYPE_SD_CARD);
+        qdev_prop_set_drive_err(carddev, "drive", blk, &error_fatal);
+        qdev_realize_and_unref(carddev,
+                               qdev_get_child_bus(DEVICE(&soc->mmc[i]),
+                                                  "sd-bus"),
+                               &error_fatal);
+    }
 
     memory_region_add_subregion(get_system_memory(), 0x80000000,
                                 machine->ram);

@@ -23,12 +23,16 @@
 #include "hw/intc/am335x_intc.h"
 #include "hw/timer/am335x_timer.h"
 #include "hw/misc/am335x_prcm.h"
+#include "hw/misc/am335x_wdt.h"
+#include "hw/sd/am335x_hsmmc.h"
+#include "hw/char/am335x_uart.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
 OBJECT_DECLARE_SIMPLE_TYPE(AM335xState, AM335X_SOC)
 
 #define AM335X_NUM_TIMERS 4
+#define AM335X_NUM_MMC    2
 
 struct AM335xState {
     /*< private >*/
@@ -39,6 +43,9 @@ struct AM335xState {
     AM335xIntcState intc;
     AM335xTimerState timer[AM335X_NUM_TIMERS];
     AM335xPrcmState prcm;
+    AM335xWdtState wdt;
+    AM335xHsmmcState mmc[AM335X_NUM_MMC];
+    AM335xUartState uart0;
     MemoryRegion ocmc;
 };
 

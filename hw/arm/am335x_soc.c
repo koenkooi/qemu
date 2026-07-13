@@ -19,7 +19,8 @@
 #include "qapi/error.h"
 #include "hw/arm/am335x_soc.h"
 #include "hw/sysbus.h"
-#include "hw/char/serial-mm.h"
+#include "hw/char/am335x_uart.h"
+#include "hw/qdev-properties.h"
 #include "hw/misc/unimp.h"
 #include "system/system.h"
 #include "exec/address-spaces.h"
@@ -29,9 +30,16 @@
 #define AM335X_OCMC_BASE        0x40300000
 #define AM335X_OCMC_SIZE        (64 * KiB)
 
-/* UART0 (16550-compatible, 4-byte register spacing => regshift 2) */
+/*
+ * UART0 (16550-compatible core + OMAP soft-reset regs, regshift fixed at 2
+ * inside AM335xUartState). Real hardware's UART functional clock is 48MHz
+ * (AM335X_UART0_CLK / 16 = 3MHz baud generator input); AM335xUartState does
+ * not expose a "baudbase" property (out of scope -- see am335x_uart.c), so
+ * the embedded SerialState falls back to TYPE_SERIAL's 115200 default. That
+ * only affects host-side transmit pacing math for a real serial backend,
+ * not the pty/stdio chardevs this board actually uses.
+ */
 #define AM335X_UART0_BASE       0x44E09000
-#define AM335X_UART0_CLK        48000000
 
 /* INTC input line numbers (TRM spruh73q ch.6) */
 #define AM335X_IRQ_UART0        72
@@ -47,6 +55,15 @@ static const struct {
     { 0x48042000, 69 }, /* DMTIMER3 */
 };
 
+/* MMCHS0/1 MMIO bases and INTC input lines (TRM spruh73q ch.6/18) */
+static const struct {
+    hwaddr addr;
+    unsigned int irq;
+} am335x_mmc_table[AM335X_NUM_MMC] = {
+    { 0x48060000, 64 }, /* MMC0 -> mmcblk0 */
+    { 0x481D8000, 28 }, /* MMC1 -> mmcblk1 */
+};
+
 static void am335x_soc_init(Object *obj)
 {
     AM335xState *s = AM335X_SOC(obj);
@@ -60,6 +77,12 @@ static void am335x_soc_init(Object *obj)
                                 TYPE_AM335X_TIMER);
     }
     object_initialize_child(obj, "prcm", &s->prcm, TYPE_AM335X_PRCM);
+    object_initialize_child(obj, "wdt", &s->wdt, TYPE_AM335X_WDT);
+    for (i = 0; i < AM335X_NUM_MMC; i++) {
+        object_initialize_child(obj, "mmc[*]", &s->mmc[i],
+                                TYPE_AM335X_HSMMC);
+    }
+    object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
 static void am335x_soc_realize(DeviceState *dev, Error **errp)
@@ -90,13 +113,21 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     qdev_pass_gpios(DEVICE(&s->intc), dev, NULL);
 
     /*
-     * UART0 (16550-compatible), IRQ line 72 on the INTC.
+     * UART0 (16550-compatible core + OMAP soft-reset regs), IRQ line 72
+     * on the INTC. The OMAP-only MDR1/SYSC/SYSS window (see
+     * hw/char/am335x_uart.c) is what lets the Linux 8250_omap console
+     * driver's soft-reset probe sequence complete instead of hanging on
+     * an unmapped SYSS.RESETDONE poll, which is why this is a dedicated
+     * device instead of a plain serial_mm_init().
      * FIXME use a qdev chardev prop instead of serial_hd()
      */
-    serial_mm_init(get_system_memory(), AM335X_UART0_BASE, 2,
-                   qdev_get_gpio_in(dev, AM335X_IRQ_UART0),
-                   AM335X_UART0_CLK / 16, serial_hd(0),
-                   DEVICE_LITTLE_ENDIAN);
+    qdev_prop_set_chr(DEVICE(&s->uart0), "chardev", serial_hd(0));
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart0), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart0), 0, AM335X_UART0_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart0), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_UART0));
 
     /* DMTIMER0..3: real devices, needed for the kernel clockevent/
      * clocksource to make progress past time init. */
@@ -121,6 +152,32 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->prcm), 0, 0x44E00000);
 
     /*
+     * Watchdog Timer 1 (WDT1) @ 0x44E35000. A benign stub whose ti-sysc OCP
+     * softreset completes immediately (WD_SYSSTATUS.RESETDONE reads 1); it
+     * never arms or bites. Without it the module's softreset times out
+     * against the unimplemented-device stub, stalling boot ~220s.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt), 0, 0x44E35000);
+
+    /*
+     * MMCHS0/1 (SDHCI behind a TI wrapper). Needed so the guest can mount a
+     * rootfs from an SD image. The board attaches the actual SD cards to
+     * each controller's "sd-bus".
+     */
+    for (i = 0; i < AM335X_NUM_MMC; i++) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->mmc[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->mmc[i]), 0,
+                        am335x_mmc_table[i].addr);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->mmc[i]), 0,
+                           qdev_get_gpio_in(dev, am335x_mmc_table[i].irq));
+    }
+
+    /*
      * Placeholders for peripherals that become real devices in later
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
@@ -128,9 +185,6 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
     create_unimplemented_device("l4_wkup-control", 0x44E10000, 0x20000);
-    create_unimplemented_device("wdt1",            0x44E35000, 0x1000);
-    create_unimplemented_device("mmc0",            0x48060000, 0x1000);
-    create_unimplemented_device("mmc1",            0x481D8000, 0x10000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
 }
 

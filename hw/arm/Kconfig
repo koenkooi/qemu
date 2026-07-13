@@ -51,7 +51,9 @@ config BEAGLEBONE
     select AM335X_INTC
     select AM335X_TIMER
     select AM335X_PRCM
-    select SERIAL_MM
+    select AM335X_WDT
+    select AM335X_HSMMC
+    select AM335X_UART
     select UNIMP
 
 config DIGIC
