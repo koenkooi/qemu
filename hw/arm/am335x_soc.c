@@ -20,8 +20,10 @@
 #include "hw/arm/am335x_soc.h"
 #include "hw/sysbus.h"
 #include "hw/char/am335x_uart.h"
+#include "hw/net/am335x_cpsw.h"
 #include "hw/qdev-properties.h"
 #include "hw/misc/unimp.h"
+#include "net/net.h"
 #include "system/system.h"
 #include "exec/address-spaces.h"
 #include "target/arm/cpu-qom.h"
@@ -48,6 +50,15 @@
  * interrupts <36> in am33xx-l4.dtsi). */
 #define AM335X_LCDC_BASE        0x4830E000
 #define AM335X_IRQ_LCDC         36
+
+/* CPSW Ethernet switch subsystem (TRM spruh73q ch.14; DT switch@0 at
+ * target-module@100000, base 0x4A100000, interrupts <40 41 42 43> =
+ * rx_thresh/rx/tx/misc in am33xx-l4.dtsi). */
+#define AM335X_CPSW_BASE        0x4A100000
+#define AM335X_IRQ_CPSW_RXTHR   40
+#define AM335X_IRQ_CPSW_RX      41
+#define AM335X_IRQ_CPSW_TX      42
+#define AM335X_IRQ_CPSW_MISC    43
 
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
@@ -127,6 +138,7 @@ static void am335x_soc_init(Object *obj)
     }
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_AM335X_RTC);
     object_initialize_child(obj, "lcdc", &s->lcdc, TYPE_AM335X_LCDC);
+    object_initialize_child(obj, "cpsw", &s->cpsw, TYPE_AM335X_CPSW);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -300,13 +312,36 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(dev, AM335X_IRQ_LCDC));
 
     /*
+     * CPSW Ethernet switch subsystem @ 0x4A100000 (with the davinci MDIO
+     * sub-block at 0x4A101000 and the on-chip descriptor SRAM at
+     * 0x4A102000). A real device so the built-in cpsw-switch/davinci_mdio
+     * drivers bind, the on-board PHY reports link, and the guest gets a
+     * DHCP lease over the SoC NIC. The four INTC lines are rx_thresh/rx/
+     * tx/misc (40..43); only rx (41) and tx (42) are driven.
+     * qemu_configure_nic_device() binds the default -nic/-netdev before
+     * realize so the embedded NIC connects to it.
+     */
+    qemu_configure_nic_device(DEVICE(&s->cpsw), true, NULL);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->cpsw), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->cpsw), 0, AM335X_CPSW_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_RXTHR));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 1,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_RX));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 2,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_TX));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 3,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_MISC));
+
+    /*
      * Placeholders for peripherals that become real devices in later
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
      */
     create_unimplemented_device("tscadc",          0x44E0D000, 0x1000);
     create_unimplemented_device("counter32k",      0x44E86000, 0x1000);
-    create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
 }
 
 static void am335x_soc_class_init(ObjectClass *oc, void *data)
