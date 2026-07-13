@@ -24,6 +24,7 @@
 #include "hw/timer/am335x_timer.h"
 #include "hw/misc/am335x_prcm.h"
 #include "hw/misc/am335x_wdt.h"
+#include "hw/misc/am335x_control.h"
 #include "hw/sd/am335x_hsmmc.h"
 #include "hw/char/am335x_uart.h"
 #include "qom/object.h"
@@ -44,6 +45,7 @@ struct AM335xState {
     AM335xTimerState timer[AM335X_NUM_TIMERS];
     AM335xPrcmState prcm;
     AM335xWdtState wdt;
+    AM335xControlState control;
     AM335xHsmmcState mmc[AM335X_NUM_MMC];
     AM335xUartState uart0;
     MemoryRegion ocmc;

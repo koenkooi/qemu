@@ -44,15 +44,20 @@
 /* INTC input line numbers (TRM spruh73q ch.6) */
 #define AM335X_IRQ_UART0        72
 
-/* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20) */
+/* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
+ * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
+ * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
+ * have SOFTRESET at bit 0. Linux uses DMTIMER1 as the always-on
+ * clocksource, so getting this wrong stops timekeeping. */
 static const struct {
     hwaddr addr;
     unsigned int irq;
+    bool one_ms;
 } am335x_timer_table[AM335X_NUM_TIMERS] = {
-    { 0x44E05000, 66 }, /* DMTIMER0 */
-    { 0x44E31000, 67 }, /* DMTIMER1 (1ms, not modelled specially here) */
-    { 0x48040000, 68 }, /* DMTIMER2 */
-    { 0x48042000, 69 }, /* DMTIMER3 */
+    { 0x44E05000, 66, false }, /* DMTIMER0 */
+    { 0x44E31000, 67, true  }, /* DMTIMER1 (1ms, always-on clocksource) */
+    { 0x48040000, 68, false }, /* DMTIMER2 */
+    { 0x48042000, 69, false }, /* DMTIMER3 */
 };
 
 /* MMCHS0/1 MMIO bases and INTC input lines (TRM spruh73q ch.6/18) */
@@ -78,6 +83,7 @@ static void am335x_soc_init(Object *obj)
     }
     object_initialize_child(obj, "prcm", &s->prcm, TYPE_AM335X_PRCM);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_AM335X_WDT);
+    object_initialize_child(obj, "control", &s->control, TYPE_AM335X_CONTROL);
     for (i = 0; i < AM335X_NUM_MMC; i++) {
         object_initialize_child(obj, "mmc[*]", &s->mmc[i],
                                 TYPE_AM335X_HSMMC);
@@ -132,6 +138,8 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     /* DMTIMER0..3: real devices, needed for the kernel clockevent/
      * clocksource to make progress past time init. */
     for (i = 0; i < AM335X_NUM_TIMERS; i++) {
+        qdev_prop_set_bit(DEVICE(&s->timer[i]), "one-ms",
+                          am335x_timer_table[i].one_ms);
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer[i]), errp)) {
             return;
         }
@@ -163,6 +171,20 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt), 0, 0x44E35000);
 
     /*
+     * Control Module (System Control Module) @ 0x44E10000. Its sole
+     * functional job here is to report a 24MHz input crystal via
+     * CONTROL_STATUS.SYSBOOT1, so the kernel's derived sys_clkin (and the
+     * dmtimer clocksource rate) match the 24MHz our DMTIMER model runs at.
+     * A mismatch makes the generic sched_clock 32-bit wrap handling
+     * miscalibrate and freeze every timestamp at ~223s. See
+     * hw/misc/am335x_control.c.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->control), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->control), 0, 0x44E10000);
+
+    /*
      * MMCHS0/1 (SDHCI behind a TI wrapper). Needed so the guest can mount a
      * rootfs from an SD image. The board attaches the actual SD cards to
      * each controller's "sd-bus".
@@ -185,7 +207,6 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("gpio0",           0x44E07000, 0x1000);
     create_unimplemented_device("tscadc",          0x44E0D000, 0x1000);
     create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
-    create_unimplemented_device("l4_wkup-control", 0x44E10000, 0x20000);
     create_unimplemented_device("rtc",             0x44E3E000, 0x1000);
     create_unimplemented_device("counter32k",      0x44E86000, 0x1000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
