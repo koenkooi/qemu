@@ -1,10 +1,12 @@
 /*
  * NXP TDA19988 HDMI encoder (DRM bridge "nxp,tda998x") -- minimal I2C model.
  *
- * Reference: drivers/gpu/drm/bridge/tda998x_drv.c. On the BeagleBone Black the
- * encoder sits on I2C0 at 0x70 (paged register file) with a second, unpaged
- * register bank at the CEC address 0x34, and drives an HPD/EDID interrupt into
- * GPIO1 line 25 (interrupts-extended = <&gpio1 25 IRQ_TYPE_LEVEL_LOW>).
+ * Reference: drivers/gpu/drm/bridge/tda998x_drv.c and, for the CEC mailbox at
+ * the same 0x34 address, drivers/media/cec/i2c/tda9950.c. On the BeagleBone
+ * Black the encoder sits on I2C0 at 0x70 (paged register file) with a second,
+ * unpaged register bank at the CEC address 0x34, and drives a shared
+ * HPD/EDID/CEC interrupt into GPIO1 line 25 (interrupts-extended =
+ * <&gpio1 25 IRQ_TYPE_LEVEL_LOW>).
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -46,7 +48,8 @@ struct TDA19988State {
     bool first;          /* next byte is the sub-address (or REG_CURPAGE) */
     bool page_select;    /* next byte selects the page (after a 0xff write) */
 
-    /* One fixed-mode EDID served from page 0x09 offsets 0x00..0x7f. */
+    /* EDID served from page 0x09 offsets 0x00..0x7f; see tda19988_realize()
+     * for how qemu_edid_generate()'s output is extended. */
     uint8_t edid[128];
     qemu_edid_info edid_info;
 
@@ -54,15 +57,27 @@ struct TDA19988State {
     bool hpd_pending;
     bool edid_pending;
     bool edid_armed;     /* saw REG_EDID_CTRL <- 1, awaiting the <- 0 */
+    bool cec_pending;    /* TDA9950 mailbox message ready (REG_CSR CSR_INT) */
 
-    /* HPD/EDID interrupt out to GPIO1 line 25 (idle high, asserted low). */
+    /* HPD/EDID/CEC interrupt out to GPIO1 line 25 (idle high, asserted low;
+     * shared with the tda9950 CEC driver, exactly as on real silicon where
+     * both drivers request_threaded_irq() the same host IRQ number). */
     qemu_irq irq;
+
+    /* HDMI sink present (cable connected). A qom-set "connected" toggle
+     * (see tda19988_set_connected()) flips this and latches a fresh HPD
+     * edge, the same as a real plug/unplug. Defaults to true so scanout
+     * comes up unattended. */
+    bool connected;
 };
 
 /*
  * Secondary CEC-address (0x34) front-end. On real silicon this is the same die
  * answering a second bus address; here it is a thin I2C slave sharing the main
- * device's state via the "hdmi" QOM link.
+ * device's state via the "hdmi" QOM link. Two disjoint register ranges live
+ * here (see tda19988.c): the tda998x driver's own HPD/CEC-status registers
+ * (0xee/0xfd/0xfe) and the TDA9950 CEC command-processor "mailbox" registers
+ * (0x00-0x02, 0x07..) that drivers/media/cec/i2c/tda9950.c drives.
  */
 struct TDA19988CecState {
     /*< private >*/
@@ -72,6 +87,17 @@ struct TDA19988CecState {
     TDA19988State *hdmi;
     uint8_t addr_ptr;
     bool first;
+    bool mailbox_write;  /* this transaction's first byte addressed REG_CDR0 */
+
+    /* TDA9950 register-file shadow (REG_CCR/ACKH/ACKL/CCONR; TDA9950 datasheet
+     * via drivers/media/cec/i2c/tda9950.c). */
+    uint8_t ccr;
+    uint16_t log_addrs;
+    uint8_t cconr;
+
+    /* REG_CDR0.. command/reply mailbox; sized to match the driver's own
+     * `u8 buf[19]` read in tda9950_irq(). */
+    uint8_t mailbox[19];
 };
 
 #endif /* HW_DISPLAY_TDA19988_H */
