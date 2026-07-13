@@ -53,6 +53,9 @@ config AM335X_PRCM
 config AM335X_WDT
     bool
 
+config AM335X_CONTROL
+    bool
+
 config MOS6522
     bool
 
