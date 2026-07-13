@@ -70,6 +70,10 @@ config LAN9118
     select LAN9118_PHY
     select PTIMER
 
+config AM335X_CPSW
+    bool
+    select LAN9118_PHY
+
 config NE2000_ISA
     bool
     default y
