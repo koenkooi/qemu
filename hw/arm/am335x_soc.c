@@ -69,6 +69,15 @@ static const struct {
     { 0x481D8000, 28 }, /* MMC1 -> mmcblk1 */
 };
 
+/* I2C0 MMIO base and INTC input line (TRM spruh73q ch.6/21; DT
+ * interrupts <70> in am33xx-l4.dtsi). I2C1/I2C2 stay unimplemented. */
+static const struct {
+    hwaddr addr;
+    unsigned int irq;
+} am335x_i2c_table[AM335X_NUM_I2C] = {
+    { 0x44E0B000, 70 }, /* I2C0 */
+};
+
 /* GPIO0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/25;
  * DT interrupts 96/98/32/62 in am33xx-l4.dtsi). datain_reset seeds the
  * static input level: GPIO0 line 6 is the microSD card-detect
@@ -108,6 +117,10 @@ static void am335x_soc_init(Object *obj)
         object_initialize_child(obj, "mmc[*]", &s->mmc[i],
                                 TYPE_AM335X_HSMMC);
     }
+    for (i = 0; i < AM335X_NUM_I2C; i++) {
+        object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_AM335X_I2C);
+    }
+    object_initialize_child(obj, "rtc", &s->rtc, TYPE_AM335X_RTC);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -238,13 +251,40 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * I2C0 @ 0x44E0B000, IRQ 70. A real master controller so the on-board
+     * I2C slaves (board-ID EEPROM, TPS65217 PMIC) can be probed; also
+     * services the ti-sysc OCP softreset that would otherwise stall boot
+     * against an unimplemented stub (cf. WDT1). The board attaches the
+     * slaves to this controller's I2C bus.
+     */
+    for (i = 0; i < AM335X_NUM_I2C; i++) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->i2c[i]), 0,
+                        am335x_i2c_table[i].addr);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
+                           qdev_get_gpio_in(dev, am335x_i2c_table[i].irq));
+    }
+
+    /*
+     * RTC @ 0x44E3E000, IRQ 75 (periodic) and 76 (alarm). Its ti-sysc
+     * wrapper does no OCP softreset (srst_shift = -ENODEV), so unlike the
+     * blocks above there is no reset-done poll to satisfy.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rtc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtc), 0, 0x44E3E000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 0, qdev_get_gpio_in(dev, 75));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 1, qdev_get_gpio_in(dev, 76));
+
+    /*
      * Placeholders for peripherals that become real devices in later
      * milestones. Mapping them as unimplemented devices means stray guest
      * MMIO is logged instead of aborting the machine.
      */
     create_unimplemented_device("tscadc",          0x44E0D000, 0x1000);
-    create_unimplemented_device("i2c0",            0x44E0B000, 0x1000);
-    create_unimplemented_device("rtc",             0x44E3E000, 0x1000);
     create_unimplemented_device("counter32k",      0x44E86000, 0x1000);
     create_unimplemented_device("cpsw",            0x4A100000, 0x8000);
 }

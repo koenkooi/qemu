@@ -24,6 +24,10 @@
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
 #include "hw/misc/led.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/am335x_i2c.h"
+#include "hw/misc/tps65217.h"
+#include "hw/nvram/eeprom_at24c.h"
 #include "system/blockdev.h"
 #include "exec/address-spaces.h"
 
@@ -101,6 +105,32 @@ static void beaglebone_init(MachineState *machine)
                                           LED_COLOR_BLUE, bbb_usr_led_desc[i]);
         qdev_connect_gpio_out(DEVICE(&soc->gpio[1]), 21 + i,
                               qdev_get_gpio_in(DEVICE(led), 0));
+    }
+
+    /*
+     * On-board I2C0 slaves. Which slaves sit on which bus at which address
+     * is board-level policy, so the wiring lives here rather than in the
+     * SoC (matching the SD-card attachment above).
+     *
+     * The board-ID EEPROM is an atmel,24c32 (4KB) at 0x50 carrying the
+     * BeagleBone SRM header (magic 0xAA5533EE, board "A335BNLT", rev "00C0").
+     * A real, mostly-unwritten EEPROM reads 0xFF outside the header.
+     *
+     * The TPS65217C PMIC is at 0x24; the Linux mfd driver only needs its
+     * CHIPID read (0xE2) to ACK for the regulator/charger children to probe.
+     */
+    {
+        I2CBus *i2c0 = am335x_i2c_bus(DEVICE(&soc->i2c[0]));
+        uint8_t board_id_eeprom[4096];
+
+        memset(board_id_eeprom, 0xFF, sizeof(board_id_eeprom));
+        memcpy(board_id_eeprom,
+               "\xAA\x55\x33\xEE" "A335BNLT" "00C0" "4115BBBK0001",
+               4 + 8 + 4 + 12);
+        at24c_eeprom_init_rom(i2c0, 0x50, sizeof(board_id_eeprom),
+                              board_id_eeprom, sizeof(board_id_eeprom));
+
+        i2c_slave_create_simple(i2c0, TYPE_TPS65217_PMU, 0x24);
     }
 
     memory_region_add_subregion(get_system_memory(), 0x80000000,

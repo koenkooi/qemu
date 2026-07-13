@@ -56,6 +56,10 @@ config BEAGLEBONE
     select AM335X_GPIO
     select AM335X_HSMMC
     select AM335X_UART
+    select AM335X_I2C
+    select AM335X_RTC
+    select AT24C
+    select TPS65217_PMU
     select LED
     select UNIMP
 

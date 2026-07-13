@@ -28,6 +28,8 @@
 #include "hw/gpio/am335x_gpio.h"
 #include "hw/sd/am335x_hsmmc.h"
 #include "hw/char/am335x_uart.h"
+#include "hw/i2c/am335x_i2c.h"
+#include "hw/rtc/am335x_rtc.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -36,6 +38,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AM335xState, AM335X_SOC)
 #define AM335X_NUM_TIMERS 4
 #define AM335X_NUM_MMC    2
 #define AM335X_NUM_GPIO   4
+#define AM335X_NUM_I2C    1   /* I2C0 only; I2C1/I2C2 remain unimplemented */
 
 struct AM335xState {
     /*< private >*/
@@ -51,6 +54,8 @@ struct AM335xState {
     AM335xGpioState gpio[AM335X_NUM_GPIO];
     AM335xHsmmcState mmc[AM335X_NUM_MMC];
     AM335xUartState uart0;
+    AM335xI2cState i2c[AM335X_NUM_I2C];
+    AM335xRtcState rtc;
     MemoryRegion ocmc;
 };
 
