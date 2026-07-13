@@ -52,6 +52,13 @@ static void beaglebone_init(MachineState *machine)
      * Attach SD/MMC cards from -sd (first IF_SD drive -> MMC0 -> mmcblk0,
      * second -> MMC1 -> mmcblk1). Which drive backs which controller is a
      * board-level policy, so the wiring lives here rather than in the SoC.
+     *
+     * MMC0 is the removable microSD, so it gets a TYPE_SD_CARD. MMC1 is the
+     * soldered-on eMMC (DT &mmc2: non-removable, 8-bit): give it a TYPE_EMMC
+     * so the guest's MMC init path (CMD1 SEND_OP_COND, CMD8 SEND_EXT_CSD)
+     * is answered -- an SD card would NAK CMD1 and never enumerate. TYPE_EMMC
+     * is user_creatable=false ("soldered on board"), which is why it is wired
+     * from board code here rather than via -device.
      */
     for (i = 0; i < AM335X_NUM_MMC; i++) {
         DriveInfo *di = drive_get(IF_SD, 0, i);
@@ -61,7 +68,7 @@ static void beaglebone_init(MachineState *machine)
         if (!blk) {
             continue;
         }
-        carddev = qdev_new(TYPE_SD_CARD);
+        carddev = qdev_new(i == 1 ? TYPE_EMMC : TYPE_SD_CARD);
         qdev_prop_set_drive_err(carddev, "drive", blk, &error_fatal);
         qdev_realize_and_unref(carddev,
                                qdev_get_child_bus(DEVICE(&soc->mmc[i]),
