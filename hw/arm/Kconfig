@@ -58,6 +58,8 @@ config BEAGLEBONE
     select AM335X_UART
     select AM335X_I2C
     select AM335X_RTC
+    select AM335X_LCDC
+    select TDA19988
     select AT24C
     select TPS65217_PMU
     select LED

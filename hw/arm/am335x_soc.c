@@ -44,6 +44,11 @@
 /* INTC input line numbers (TRM spruh73q ch.6) */
 #define AM335X_IRQ_UART0        72
 
+/* LCD Controller (TRM spruh73q ch.13; DT lcdc@0 at target-module@e000,
+ * interrupts <36> in am33xx-l4.dtsi). */
+#define AM335X_LCDC_BASE        0x4830E000
+#define AM335X_IRQ_LCDC         36
+
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
  * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
@@ -121,6 +126,7 @@ static void am335x_soc_init(Object *obj)
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_AM335X_I2C);
     }
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_AM335X_RTC);
+    object_initialize_child(obj, "lcdc", &s->lcdc, TYPE_AM335X_LCDC);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -278,6 +284,20 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtc), 0, 0x44E3E000);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 0, qdev_get_gpio_in(dev, 75));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 1, qdev_get_gpio_in(dev, 76));
+
+    /*
+     * LCD Controller @ 0x4830E000, IRQ 36. Its PID register reports the
+     * rev-2 LCDC so the Linux tilcdc driver binds and, together with the
+     * on-board TDA19988 HDMI encoder (wired on I2C0 by the board), scans out
+     * a DRM/fbdev framebuffer. The INTC line carries the end-of-frame (vblank)
+     * and frame/palette-done interrupts (see am335x_lcdc.c).
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->lcdc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lcdc), 0, AM335X_LCDC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lcdc), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_LCDC));
 
     /*
      * Placeholders for peripherals that become real devices in later

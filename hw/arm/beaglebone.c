@@ -27,6 +27,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/am335x_i2c.h"
 #include "hw/misc/tps65217.h"
+#include "hw/display/tda19988.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "system/blockdev.h"
 #include "exec/address-spaces.h"
@@ -131,6 +132,27 @@ static void beaglebone_init(MachineState *machine)
                               board_id_eeprom, sizeof(board_id_eeprom));
 
         i2c_slave_create_simple(i2c0, TYPE_TPS65217_PMU, 0x24);
+
+        /*
+         * TDA19988 HDMI encoder (DT: &i2c0 tda19988@70). It answers two I2C
+         * addresses -- the main paged bank at 0x70 and the CEC bank at 0x34 --
+         * modelled as two slaves sharing one state via the CEC device's "hdmi"
+         * link. Its HPD/EDID interrupt drives GPIO1 line 25
+         * (interrupts-extended = <&gpio1 25 IRQ_TYPE_LEVEL_LOW>), which the
+         * tda998x driver's EDID-block-ready wait depends on.
+         */
+        {
+            I2CSlave *hdmi = i2c_slave_new(TYPE_TDA19988, 0x70);
+            I2CSlave *cec = i2c_slave_new(TYPE_TDA19988_CEC, 0x34);
+
+            i2c_slave_realize_and_unref(hdmi, i2c0, &error_fatal);
+            object_property_set_link(OBJECT(cec), "hdmi", OBJECT(hdmi),
+                                     &error_fatal);
+            i2c_slave_realize_and_unref(cec, i2c0, &error_fatal);
+
+            qdev_connect_gpio_out(DEVICE(hdmi), 0,
+                                  qdev_get_gpio_in(DEVICE(&soc->gpio[1]), 25));
+        }
     }
 
     memory_region_add_subregion(get_system_memory(), 0x80000000,

@@ -30,6 +30,7 @@
 #include "hw/char/am335x_uart.h"
 #include "hw/i2c/am335x_i2c.h"
 #include "hw/rtc/am335x_rtc.h"
+#include "hw/display/am335x_lcdc.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -56,6 +57,7 @@ struct AM335xState {
     AM335xUartState uart0;
     AM335xI2cState i2c[AM335X_NUM_I2C];
     AM335xRtcState rtc;
+    AM335xLcdcState lcdc;
     MemoryRegion ocmc;
 };
 
