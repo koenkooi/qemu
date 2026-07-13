@@ -60,6 +60,7 @@ config BEAGLEBONE
     select AM335X_RTC
     select AM335X_LCDC
     select AM335X_CPSW
+    select AM335X_USBSS
     select TDA19988
     select AT24C
     select TPS65217_PMU

@@ -60,6 +60,12 @@
 #define AM335X_IRQ_CPSW_TX      42
 #define AM335X_IRQ_CPSW_MISC    43
 
+/* USB Subsystem "clean probe" stub (TRM spruh73q ch.16; DT
+ * target-module@47400000, ranges <0x0 0x47400000 0x8000>). No IRQ is
+ * wired -- see hw/misc/am335x_usbss.c -- since this model never generates
+ * USB controller activity. */
+#define AM335X_USBSS_BASE       0x47400000
+
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
  * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
@@ -139,6 +145,7 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_AM335X_RTC);
     object_initialize_child(obj, "lcdc", &s->lcdc, TYPE_AM335X_LCDC);
     object_initialize_child(obj, "cpsw", &s->cpsw, TYPE_AM335X_CPSW);
+    object_initialize_child(obj, "usbss", &s->usbss, TYPE_AM335X_USBSS);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -334,6 +341,23 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_TX));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 3,
                        qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_MISC));
+
+    /*
+     * USB Subsystem (USBSS) @ 0x47400000, a "clean probe" register-file
+     * stub covering the whole 32KB target-module window (USB0/USB1
+     * control+mc blocks and the CPPI4.1 DMA glue/queue-manager range).
+     * Its sole functional job is to let musb-hdrc/musb_dsps probe
+     * without the -ENODEV that a fully-unmapped window causes (real
+     * silicon's USBnREV wrapper-revision register reads back non-zero;
+     * unassigned memory does not) and register a host/gadget instance.
+     * No USB device enumeration, transfer, or CPPI DMA is modelled --
+     * see hw/misc/am335x_usbss.c -- and no IRQ line is connected since
+     * this stub never generates controller activity.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->usbss), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbss), 0, AM335X_USBSS_BASE);
 
     /*
      * Placeholders for peripherals that become real devices in later

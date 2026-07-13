@@ -32,6 +32,7 @@
 #include "hw/rtc/am335x_rtc.h"
 #include "hw/display/am335x_lcdc.h"
 #include "hw/net/am335x_cpsw.h"
+#include "hw/misc/am335x_usbss.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -60,6 +61,7 @@ struct AM335xState {
     AM335xRtcState rtc;
     AM335xLcdcState lcdc;
     AM335xCpswState cpsw;
+    AM335xUsbssState usbss;
     MemoryRegion ocmc;
 };
 
