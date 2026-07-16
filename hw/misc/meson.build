@@ -20,6 +20,7 @@ system_ss.add(when: 'CONFIG_AM335X_CONTROL', if_true: files('am335x_control.c'))
 system_ss.add(when: 'CONFIG_AM335X_EMIF', if_true: files('am335x_emif.c'))
 system_ss.add(when: 'CONFIG_AM335X_USBSS', if_true: files('am335x_usbss.c'))
 system_ss.add(when: 'CONFIG_TPS65217_PMU', if_true: files('tps65217.c'))
+system_ss.add(when: 'CONFIG_TPS65214_PMU', if_true: files('tps65214.c'))
 
 system_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('armv7m_ras.c'))
 

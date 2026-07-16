@@ -66,6 +66,10 @@ config TPS65217_PMU
     bool
     depends on I2C
 
+config TPS65214_PMU
+    bool
+    depends on I2C
+
 config MOS6522
     bool
 
