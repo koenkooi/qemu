@@ -217,6 +217,18 @@ static void am335x_i2c_con_write(AM335xI2cState *s, uint16_t value)
             /* Pre-fetch the first byte so I2C_DATA has something to hand
              * back on the first read. */
             s->data = i2c_recv(s->bus);
+        } else if (s->count_cur == 0) {
+            /*
+             * Zero-length transfer: the address phase alone, with no data
+             * to move. The DM i2c core probes a chip this way
+             * (dm_i2c_probe -> a 0-byte write), which is how u-boot SPL's
+             * ti_i2c_eeprom board detection first opens the board-ID EEPROM.
+             * There is no data phase to drive am335x_i2c_xfer_complete(), so
+             * finish the transfer here -- otherwise ARDY is never raised and
+             * the omap_i2c driver's completion wait times out (~1s) and the
+             * probe/read is abandoned.
+             */
+            am335x_i2c_xfer_complete(s);
         }
     }
     am335x_i2c_update_irq(s);
