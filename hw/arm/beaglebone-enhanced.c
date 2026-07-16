@@ -35,12 +35,17 @@
  *    board/ti/am335x/mux.c enable_board_pin_mux() independently confirms this:
  *    board_is_bben() selects rgmii1_pin_mux instead of Black's mii1_pin_mux.
  *    This is the same on-chip CPSW/MDIO silicon as Black (TYPE_AM335X_SOC,
- *    unchanged) talking to a different *external* RGMII PHY -- not something
- *    the shared hw/net/am335x_cpsw.c model (which reuses the 10/100-only
- *    lan9118_phy) can represent without editing that shared peripheral model,
- *    which is out of scope for this purely-additive board-wiring change (same
- *    category of gap as the HDMI-audio note in hw/display/tda19988.c). So the
- *    modelled NIC here still behaves like Black's 100Mbit link.
+ *    unchanged) talking to a different *external* RGMII PHY. We model that by
+ *    setting the CPSW's "gigabit-phy" qdev property, which swaps the shared
+ *    hw/net/am335x_cpsw.c model's default 10/100 lan9118_phy for a TI DP83867
+ *    Gigabit RGMII PHY that reports a 1000Mbit/full link. NOTE: Sancloud's own
+ *    DT does not name the PHY chip (it relies on Linux phylib's MDIO ID-register
+ *    autoprobe), so the specific chip is not directly confirmed from Sancloud's
+ *    BOM/schematic here; the DP83867 is inferred by close analogy to the
+ *    BeagleBone Green Eco (am335x-bonegreen-eco.dts), whose identical RGMII
+ *    setup *does* name "ti,dp83867" explicitly on the same CPSW/MDIO silicon,
+ *    and which TI's AM335x reference designs commonly pair with -- the closest
+ *    concrete evidence available.
  *  - USB hub + sensors, not modelled: am335x-sancloud-bbe-common.dtsi adds a
  *    "usb2512b@2c" USB hub on I2C0, and am335x-sancloud-bbe.dts (the board
  *    file itself, not the shared -common.dtsi) adds "lps331ap@5c" (barometer)
@@ -85,6 +90,7 @@
 #include "qemu/error-report.h"
 #include "hw/boards.h"
 #include "hw/arm/am335x_soc.h"
+#include "hw/arm/am335x_bootflow.h"
 #include "hw/arm/boot.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
@@ -115,17 +121,21 @@ static void beaglebone_enhanced_init(MachineState *machine)
     AM335xState *soc;
     int i;
 
-    /* Genuine SPL/MLO chain-boot is not implemented for this board variant
-     * (see beaglebone.c's Black machine for that flow); board-variant
-     * machines are kernel-direct only, same as beaglebone-white.c. */
-    if (machine->firmware) {
-        error_report("BIOS not supported for this machine");
-        exit(1);
-    }
-
     soc = AM335X_SOC(object_new(TYPE_AM335X_SOC));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
     object_unref(OBJECT(soc));
+
+    /*
+     * Enhanced muxes the CPSW to RGMII1 with an external Gigabit PHY (see
+     * file comment above), unlike Black/White's 10/100 MII PHY. Select the
+     * CPSW model's Gigabit DP83867 variant before the SoC (and its CPSW
+     * child) is realized. The child object already exists here -- the SoC's
+     * instance_init created it -- so the board sets the property on it
+     * directly, the same way it reaches into soc->mmc/soc->gpio/soc->i2c
+     * below.
+     */
+    object_property_set_bool(OBJECT(&soc->cpsw), "gigabit-phy", true,
+                             &error_fatal);
 
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
 
@@ -216,8 +226,40 @@ static void beaglebone_enhanced_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0x80000000,
                                 machine->ram);
 
+    /*
+     * Three mutually exclusive boot paths, in priority order -- identical to
+     * beaglebone.c's Black variant (the SPL/boot-parameter address layout is
+     * fixed by the SoC, so the flow is shared via am335x_bootflow.c):
+     *
+     *  -kernel: direct Linux boot, handled by arm_load_kernel() below.
+     *  -bios <MLO>: boot the genuine SPL -> u-boot -> extlinux chain off the
+     *      SD card, with no QEMU-side kernel injection.
+     *  neither, with an SD card: what the real board does from a cold start --
+     *      the boot ROM finds MLO on the card's FAT partition itself (TRM
+     *      SPRUH73Q 26.1.8.5) and proceeds as in the -bios case.
+     *
+     * The boot-ROM SD/FAT scan targets the removable microSD on MMC0
+     * (drive_get(IF_SD, 0, 0)), never the soldered eMMC on MMC1 -- same as
+     * the real AM335x ROM's boot order for this board's SYSBOOT straps.
+     */
+    if (machine->firmware) {
+        am335x_boot_load_mlo(machine, &bbe_binfo);
+    } else if (!machine->kernel_filename) {
+        DriveInfo *di = drive_get(IF_SD, 0, 0);
+        BlockBackend *blk = di ? blk_by_legacy_dinfo(di) : NULL;
+
+        if (blk) {
+            am335x_boot_from_sd(blk, &bbe_binfo);
+        }
+    }
+
     bbe_binfo.ram_size = machine->ram_size;
     arm_load_kernel(&soc->cpu, machine, &bbe_binfo);
+
+    if (bbe_binfo.firmware_loaded) {
+        /* Runs after arm_load_kernel()'s do_cpu_reset(); sets PC to MLO. */
+        am335x_boot_register_firmware_reset(&soc->cpu, &bbe_binfo);
+    }
 }
 
 static void beaglebone_enhanced_machine_init(MachineClass *mc)

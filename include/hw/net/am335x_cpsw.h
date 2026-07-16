@@ -21,6 +21,7 @@
 #include "hw/irq.h"
 #include "net/net.h"
 #include "hw/net/lan9118_phy.h"
+#include "hw/net/dp83867_phy.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_CPSW "am335x-cpsw"
@@ -49,7 +50,16 @@ struct AM335xCpswState {
 
     NICState *nic;
     NICConf conf;
-    Lan9118PhyState mii;      /* MDIO PHY at bus address 0 (LAN8710A slot) */
+    /*
+     * MDIO PHY at bus address 0.  Boards select which one is instantiated
+     * via the "gigabit-phy" property: the default 10/100 LAN8710A-slot PHY
+     * (mii), or a TI DP83867 Gigabit RGMII PHY (gmii) for RGMII boards such
+     * as the SanCloud BeagleBone Enhanced.  Only the selected one is
+     * realized and wired into the MDIO handlers.
+     */
+    Lan9118PhyState mii;
+    DP83867PhyState gmii;
+    bool gigabit_phy;
     IRQState mii_irq;
 
     /* Guest-physical base of the descriptor SRAM (register base + 0x2000). */

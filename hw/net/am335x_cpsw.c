@@ -19,8 +19,11 @@
  *    table array (no real switching is needed for a single external port).
  *  - The two slave "sliver" MACs (CPGMAC_SL): self-clearing soft-reset and
  *    a MACSTATUS that always reports the port idle.
- *  - The davinci MDIO controller with a single PHY at bus address 0 (the
- *    on-board LAN8710A slot), so phylib finds the PHY and sees link up.
+ *  - The davinci MDIO controller with a single PHY at bus address 0, so
+ *    phylib finds the PHY and sees link up.  Which PHY sits there is a
+ *    per-instance choice (the "gigabit-phy" property): the default 10/100
+ *    lan9118_phy (the on-board LAN8710A slot of the MII boards), or a TI
+ *    DP83867 Gigabit RGMII PHY for RGMII boards (SanCloud Enhanced).
  *  - The wrapper (WR) interrupt-enable registers that gate the four INTC
  *    outputs (rx_thresh/rx/tx/misc = lines 40..43).
  *
@@ -326,6 +329,36 @@ static void cpsw_dma_soft_reset(AM335xCpswState *s)
 }
 
 /* ------------------------------------------------------------------- */
+/* Single external MDIO PHY at bus address 0.  The board picks which model
+ * via the "gigabit-phy" property (see cpsw_realize): the default 10/100
+ * lan9118_phy, or a Gigabit TI DP83867 for RGMII boards.  These wrappers
+ * dispatch to whichever one is instantiated so the rest of the model stays
+ * PHY-agnostic. */
+static uint16_t cpsw_phy_read(AM335xCpswState *s, int reg)
+{
+    return s->gigabit_phy ? dp83867_phy_read(&s->gmii, reg)
+                          : lan9118_phy_read(&s->mii, reg);
+}
+
+static void cpsw_phy_write(AM335xCpswState *s, int reg, uint16_t val)
+{
+    if (s->gigabit_phy) {
+        dp83867_phy_write(&s->gmii, reg, val);
+    } else {
+        lan9118_phy_write(&s->mii, reg, val);
+    }
+}
+
+static void cpsw_phy_update_link(AM335xCpswState *s, bool link_down)
+{
+    if (s->gigabit_phy) {
+        dp83867_phy_update_link(&s->gmii, link_down);
+    } else {
+        lan9118_phy_update_link(&s->mii, link_down);
+    }
+}
+
+/* ------------------------------------------------------------------- */
 /* MDIO USERACCESS protocol: complete each transaction synchronously so
  * the driver's "wait for GO to clear" poll returns immediately. */
 static void cpsw_mdio_access(AM335xCpswState *s, uint32_t val)
@@ -341,11 +374,11 @@ static void cpsw_mdio_access(AM335xCpswState *s, uint32_t val)
 
     if (phy == AM335X_CPSW_PHY_ADDR) {
         if (val & MDIO_USERACCESS_WRITE) {
-            lan9118_phy_write(&s->mii, reg, val & MDIO_USERACCESS_DATA);
+            cpsw_phy_write(s, reg, val & MDIO_USERACCESS_DATA);
             result = MDIO_USERACCESS_ACK;
         } else {
             result = MDIO_USERACCESS_ACK |
-                     (lan9118_phy_read(&s->mii, reg) & MDIO_USERACCESS_DATA);
+                     (cpsw_phy_read(s, reg) & MDIO_USERACCESS_DATA);
         }
     } else {
         /* No PHY at this address: complete without ACK. */
@@ -632,7 +665,7 @@ static void cpsw_set_link(NetClientState *nc)
     AM335xCpswState *s = qemu_get_nic_opaque(nc);
 
     trace_am335x_cpsw_link_status(AM335X_CPSW_TRACE_DESC, !nc->link_down);
-    lan9118_phy_update_link(&s->mii, nc->link_down);
+    cpsw_phy_update_link(s, nc->link_down);
 }
 
 static NetClientInfo net_cpsw_info = {
@@ -664,7 +697,7 @@ static void cpsw_reset(DeviceState *dev)
      * the reported link match the netdev peer. */
     trace_am335x_cpsw_link_status(AM335X_CPSW_TRACE_DESC,
                                   !qemu_get_queue(s->nic)->link_down);
-    lan9118_phy_update_link(&s->mii, qemu_get_queue(s->nic)->link_down);
+    cpsw_phy_update_link(s, qemu_get_queue(s->nic)->link_down);
 }
 
 static void cpsw_mii_irq(void *opaque, int n, int level)
@@ -694,13 +727,26 @@ static void cpsw_realize(DeviceState *dev, Error **errp)
         sysbus_init_irq(sbd, &s->irq[i]);
     }
 
-    /* MDIO PHY at bus address 0. */
+    /*
+     * MDIO PHY at bus address 0.  A board that set "gigabit-phy" gets a TI
+     * DP83867 Gigabit RGMII PHY; the default is the 10/100 lan9118_phy, so
+     * unmodified boards (Black, White) are unaffected.  Only the selected
+     * PHY is created and realized.
+     */
     qemu_init_irq(&s->mii_irq, cpsw_mii_irq, s, 0);
-    object_initialize_child(OBJECT(s), "mii", &s->mii, TYPE_LAN9118_PHY);
-    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mii), errp)) {
-        return;
+    if (s->gigabit_phy) {
+        object_initialize_child(OBJECT(s), "gmii", &s->gmii, TYPE_DP83867_PHY);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gmii), errp)) {
+            return;
+        }
+        qdev_connect_gpio_out(DEVICE(&s->gmii), 0, &s->mii_irq);
+    } else {
+        object_initialize_child(OBJECT(s), "mii", &s->mii, TYPE_LAN9118_PHY);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->mii), errp)) {
+            return;
+        }
+        qdev_connect_gpio_out(DEVICE(&s->mii), 0, &s->mii_irq);
     }
-    qdev_connect_gpio_out(DEVICE(&s->mii), 0, &s->mii_irq);
 
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_cpsw_info, &s->conf,
@@ -733,6 +779,13 @@ static const Property cpsw_properties[] = {
     DEFINE_NIC_PROPERTIES(AM335xCpswState, conf),
     DEFINE_PROP_UINT32("dma-desc-base", AM335xCpswState, dma_desc_base,
                        0x4A102000),
+    /*
+     * false (default): the 10/100 lan9118_phy, matching the on-board
+     * LAN8710A of the MII-wired boards (Black, White) -- unchanged behaviour.
+     * true: a TI DP83867 Gigabit RGMII PHY, for boards that mux the CPSW to
+     * RGMII (SanCloud BeagleBone Enhanced, Green Eco).
+     */
+    DEFINE_PROP_BOOL("gigabit-phy", AM335xCpswState, gigabit_phy, false),
 };
 
 static void cpsw_class_init(ObjectClass *klass, void *data)

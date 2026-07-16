@@ -21,6 +21,12 @@ lan9118_phy_write(uint16_t val, int reg) "[0x%02x] <- 0x%04" PRIx16
 lan9118_phy_update_link(const char *s) "%s"
 lan9118_phy_reset(void) ""
 
+# dp83867_phy.c
+dp83867_phy_read(uint16_t val, int reg) "[0x%02x] -> 0x%04" PRIx16
+dp83867_phy_write(uint16_t val, int reg) "[0x%02x] <- 0x%04" PRIx16
+dp83867_phy_update_link(const char *s) "%s"
+dp83867_phy_reset(void) ""
+
 # lance.c
 lance_mem_readw(uint64_t addr, uint32_t ret) "addr=0x%"PRIx64"val=0x%04x"
 lance_mem_writew(uint64_t addr, uint32_t val) "addr=0x%"PRIx64"val=0x%04x"
