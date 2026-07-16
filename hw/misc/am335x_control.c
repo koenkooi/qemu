@@ -48,6 +48,19 @@
 #define CONTROL_STATUS  0x040
 
 /*
+ * VTP0_CTRL (0xE0C, VTP0_CTRL_ADDR in u-boot arch-am33xx/hardware_am33xx.h).
+ * The AM335x SPL's DDR3 impedance calibration, config_vtp()
+ * (arch/arm/mach-omap2/am33xx/emif4.c), enables the VTP block, writes
+ * START_EN (bit 0), then busy-waits for READY (bit 5). Real hardware sets
+ * READY a few cycles after the START_EN rising edge; there is no separate
+ * calibration to model here, so READY is synthesized as "set whenever
+ * START_EN is set" -- the same read-side transform idiom as CONTROL_STATUS.
+ */
+#define CONTROL_VTP0        0xE0C
+#define VTP_CTRL_START_EN   (1u << 0)
+#define VTP_CTRL_READY      (1u << 5)
+
+/*
  * CONTROL_STATUS.SYSBOOT1 (bits[23:22]) input-crystal selector, matching
  * the "sys_clkin_ck" ti,mux-clock parent order
  * {19.2, 24, 25, 26} MHz -> index {0, 1, 2, 3}. The BeagleBone Black has
@@ -75,6 +88,14 @@ static uint64_t am335x_control_read(void *opaque, hwaddr offset, unsigned size)
          * the SYSBOOT/boot-status field is left at 0; nothing in this
          * boot path depends on it. */
         return CONTROL_STATUS_SYSBOOT1_24MHZ;
+    case CONTROL_VTP0: {
+        /* Synthesize the VTP calibration READY bit once START_EN is set. */
+        uint32_t v = s->regs[offset / 4];
+        if (v & VTP_CTRL_START_EN) {
+            v |= VTP_CTRL_READY;
+        }
+        return v;
+    }
     default:
         return s->regs[offset / 4];
     }
