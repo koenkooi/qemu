@@ -53,6 +53,7 @@ config BEAGLEBONE
     select AM335X_PRCM
     select AM335X_WDT
     select AM335X_CONTROL
+    select AM335X_EMIF
     select AM335X_GPIO
     select AM335X_HSMMC
     select AM335X_UART

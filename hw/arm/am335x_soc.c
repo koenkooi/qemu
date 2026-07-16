@@ -28,9 +28,23 @@
 #include "exec/address-spaces.h"
 #include "target/arm/cpu-qom.h"
 
-/* On-chip memory (internal SRAM) */
+/* On-chip memory (L3 OCMC RAM, 64KB, TRM spruh73q ch.7.2). */
 #define AM335X_OCMC_BASE        0x40300000
 #define AM335X_OCMC_SIZE        (64 * KiB)
+
+/*
+ * Lower internal SRAM bank (TRM spruh73q Table 2-x memory map: "SRAM
+ * internal" 0x402F0400..0x402FFFFF, with 0x402F0000..0x402F03FF reserved).
+ * On a GP device the ROM downloads the SPL/MLO image directly here at
+ * 0x402F0400 (CONFIG_SPL_TEXT_BASE) and it runs across this bank and the
+ * adjacent OCMC RAM as one contiguous 0x402F0400..0x4030FFFF window
+ * (NON_SECURE_SRAM_START..END in u-boot's arch-am33xx/omap.h). Only the
+ * OCMC half was modelled before; SPL text/BSS/stack straddle both, so the
+ * lower bank must exist too. Mapped page-aligned at 0x402F0000 (the
+ * reserved 1KB below TEXT_BASE is harmless as plain RAM).
+ */
+#define AM335X_SRAM_BASE        0x402F0000
+#define AM335X_SRAM_SIZE        (64 * KiB)
 
 /*
  * UART0 (16550-compatible core + OMAP soft-reset regs, regshift fixed at 2
@@ -131,6 +145,7 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "prcm", &s->prcm, TYPE_AM335X_PRCM);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_AM335X_WDT);
     object_initialize_child(obj, "control", &s->control, TYPE_AM335X_CONTROL);
+    object_initialize_child(obj, "emif", &s->emif, TYPE_AM335X_EMIF);
     for (i = 0; i < AM335X_NUM_GPIO; i++) {
         object_initialize_child(obj, "gpio[*]", &s->gpio[i],
                                 TYPE_AM335X_GPIO);
@@ -163,6 +178,12 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                            AM335X_OCMC_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), AM335X_OCMC_BASE,
                                 &s->ocmc);
+
+    /* Lower internal SRAM bank, contiguous below the OCMC (see above). */
+    memory_region_init_ram(&s->sram, OBJECT(dev), "am335x.sram",
+                           AM335X_SRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), AM335X_SRAM_BASE,
+                                &s->sram);
 
     /* MPU interrupt controller (INTCPS) @ 0x48200000, out 0 = IRQ, 1 = FIQ. */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->intc), errp)) {
@@ -241,6 +262,17 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->control), 0, 0x44E10000);
+
+    /*
+     * EMIF (DDR controller) @ 0x4C000000. Programmed by the SPL (MLO)
+     * during DDR3 bring-up when booting from scratch via -bios; a passive
+     * register store since the DRAM itself is plain RAM at 0x80000000.
+     * See hw/misc/am335x_emif.c.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->emif), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->emif), 0, 0x4C000000);
 
     /*
      * GPIO0..3. GPIO0's card-detect input (line 6) gates the microSD

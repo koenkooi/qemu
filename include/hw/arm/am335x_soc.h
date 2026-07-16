@@ -25,6 +25,7 @@
 #include "hw/misc/am335x_prcm.h"
 #include "hw/misc/am335x_wdt.h"
 #include "hw/misc/am335x_control.h"
+#include "hw/misc/am335x_emif.h"
 #include "hw/gpio/am335x_gpio.h"
 #include "hw/sd/am335x_hsmmc.h"
 #include "hw/char/am335x_uart.h"
@@ -54,6 +55,7 @@ struct AM335xState {
     AM335xPrcmState prcm;
     AM335xWdtState wdt;
     AM335xControlState control;
+    AM335xEmifState emif;
     AM335xGpioState gpio[AM335X_NUM_GPIO];
     AM335xHsmmcState mmc[AM335X_NUM_MMC];
     AM335xUartState uart0;
@@ -63,6 +65,7 @@ struct AM335xState {
     AM335xCpswState cpsw;
     AM335xUsbssState usbss;
     MemoryRegion ocmc;
+    MemoryRegion sram;
 };
 
 #endif /* HW_ARM_AM335X_SOC_H */
