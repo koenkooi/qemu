@@ -36,11 +36,15 @@
 #include "exec/address-spaces.h"
 
 /*
- * "From-scratch" SD boot via -bios <MLO>. QEMU stands in for the AM335x
- * boot ROM: it places the real TI SPL (MLO) at its SRAM entry point, seeds
- * the handful of boot parameters the ROM leaves in SRAM, and starts the CPU
- * there. SPL then does genuine EMIF-driven DDR3 init and reads u-boot.img
- * off the SD card's FAT partition itself -- no -kernel/-dtb/-initrd needed.
+ * "From-scratch" SD boot. QEMU stands in for the AM335x boot ROM: it
+ * places the real TI SPL (MLO) at its SRAM entry point, seeds the handful
+ * of boot parameters the ROM leaves in SRAM, and starts the CPU there.
+ * SPL then does genuine EMIF-driven DDR3 init and reads u-boot.img off the
+ * SD card's FAT partition itself -- no -kernel/-dtb/-initrd needed. The
+ * MLO image comes either from a host file (-bios <MLO>) or, when neither
+ * -bios nor -kernel is given, straight off the -sd card image's FAT
+ * partition, found the way the ROM's file-system boot mode would find it
+ * (am335x_bootrom.c).
  *
  * Addresses are the AM335x GP-device values from u-boot's
  * arch/arm/include/asm/arch-am33xx/omap.h and asm/omap_common.h:
@@ -93,32 +97,18 @@ static void bbb_firmware_reset(void *opaque)
 }
 
 /*
- * Load the real TI SPL (MLO) the way the boot ROM would: strip the TI
+ * Load a TI SPL image (MLO) the way the boot ROM would: strip the TI
  * image header, place the SPL body at its GP-header load address in SRAM,
  * and seed the ROM boot parameters. Sets bbb_binfo.firmware_loaded/entry.
+ * 'name' is only used in error messages.
  */
-static void beaglebone_load_mlo(MachineState *machine)
+static void beaglebone_load_spl(const char *name, const uint8_t *data,
+                                size_t len)
 {
-    char *fw_path;
-    gchar *contents = NULL;
-    gsize len = 0;
-    GError *gerr = NULL;
     uint32_t gp_off = 0;
     uint32_t img_size, load_addr;
     size_t body_len;
     uint8_t bootparams[0x4C];
-
-    fw_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
-    if (!fw_path) {
-        error_report("Could not find MLO firmware image '%s'",
-                     machine->firmware);
-        exit(1);
-    }
-    if (!g_file_get_contents(fw_path, &contents, &len, &gerr)) {
-        error_report("Could not read MLO '%s': %s", fw_path, gerr->message);
-        exit(1);
-    }
-    g_free(fw_path);
 
     /*
      * The TI 'omapimage' MLO for a GP device starts with a 512-byte
@@ -126,15 +116,15 @@ static void beaglebone_load_mlo(MachineState *machine)
      * size, load address) follows it. Detect the CH by its "CHSETTINGS"
      * TOC entry name at offset 0x14; a bare GP image has the header at 0.
      */
-    if (len >= 0x210 && memcmp(contents + 0x14, "CHSETTINGS", 10) == 0) {
+    if (len >= 0x210 && memcmp(data + 0x14, "CHSETTINGS", 10) == 0) {
         gp_off = 0x200;
     }
     if (len < gp_off + 8) {
-        error_report("MLO '%s' too short for a GP header", machine->firmware);
+        error_report("MLO '%s' too short for a GP header", name);
         exit(1);
     }
-    img_size = ldl_le_p(contents + gp_off);
-    load_addr = ldl_le_p(contents + gp_off + 4);
+    img_size = ldl_le_p(data + gp_off);
+    load_addr = ldl_le_p(data + gp_off + 4);
     body_len = len - gp_off - 8;
     if (img_size && img_size < body_len) {
         body_len = img_size;
@@ -146,9 +136,7 @@ static void beaglebone_load_mlo(MachineState *machine)
         exit(1);
     }
 
-    rom_add_blob_fixed("am335x.mlo", contents + gp_off + 8, body_len,
-                       load_addr);
-    g_free(contents);
+    rom_add_blob_fixed("am335x.mlo", data + gp_off + 8, body_len, load_addr);
 
     /*
      * Seed the ROM boot parameters (see the layout comment above). The blob
@@ -172,6 +160,46 @@ static void beaglebone_load_mlo(MachineState *machine)
 
     bbb_binfo.entry = load_addr;
     bbb_binfo.firmware_loaded = true;
+}
+
+/* -bios <MLO>: read the SPL from a host file. */
+static void beaglebone_load_mlo(MachineState *machine)
+{
+    char *fw_path;
+    gchar *contents = NULL;
+    gsize len = 0;
+    GError *gerr = NULL;
+
+    fw_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
+    if (!fw_path) {
+        error_report("Could not find MLO firmware image '%s'",
+                     machine->firmware);
+        exit(1);
+    }
+    if (!g_file_get_contents(fw_path, &contents, &len, &gerr)) {
+        error_report("Could not read MLO '%s': %s", fw_path, gerr->message);
+        exit(1);
+    }
+    g_free(fw_path);
+
+    beaglebone_load_spl(machine->firmware, (const uint8_t *)contents, len);
+    g_free(contents);
+}
+
+/*
+ * Bare "-sd <image>" boot, with no -bios/-kernel at all: emulate the boot
+ * ROM's SD card file-system boot (TRM SPRUH73Q 26.1.8.5) by reading the
+ * booting file "MLO" out of the card image's FAT partition ourselves, then
+ * loading it exactly as the -bios path does. am335x_bootrom.c documents
+ * the MBR/FAT walk; SD (MMC0) is this machine's only modelled boot device.
+ */
+static void beaglebone_boot_from_sd(BlockBackend *blk)
+{
+    g_autofree uint8_t *mlo = NULL;
+    size_t len = 0;
+
+    mlo = am335x_bootrom_read_mlo(blk, &len, &error_fatal);
+    beaglebone_load_spl("MLO (from SD card)", mlo, len);
 }
 
 /* On-board USR LED descriptions, keyed by GPIO1 line 21..24. These strings
@@ -290,19 +318,31 @@ static void beaglebone_init(MachineState *machine)
                                 machine->ram);
 
     /*
-     * -bios <MLO>: boot the genuine SPL -> u-boot -> extlinux chain off the
-     * SD card, with no QEMU-side kernel injection. Additive to (and mutually
-     * exclusive at runtime with) the -kernel direct-Linux-boot path, which
-     * is unchanged.
+     * Three mutually exclusive boot paths, in priority order:
+     *
+     *  -kernel: direct Linux boot, handled by arm_load_kernel() below.
+     *  -bios <MLO>: boot the genuine SPL -> u-boot -> extlinux chain off
+     *      the SD card, with no QEMU-side kernel injection.
+     *  neither, with an SD card: what the real board does from a cold
+     *      start -- the boot ROM finds MLO on the card's FAT partition
+     *      itself (TRM SPRUH73Q 26.1.8.5) and everything proceeds as in
+     *      the -bios case.
      */
     if (machine->firmware) {
         beaglebone_load_mlo(machine);
+    } else if (!machine->kernel_filename) {
+        DriveInfo *di = drive_get(IF_SD, 0, 0);
+        BlockBackend *blk = di ? blk_by_legacy_dinfo(di) : NULL;
+
+        if (blk) {
+            beaglebone_boot_from_sd(blk);
+        }
     }
 
     bbb_binfo.ram_size = machine->ram_size;
     arm_load_kernel(&soc->cpu, machine, &bbb_binfo);
 
-    if (machine->firmware) {
+    if (bbb_binfo.firmware_loaded) {
         /* Runs after arm_load_kernel()'s do_cpu_reset(); sets PC to MLO. */
         qemu_register_reset(bbb_firmware_reset, &soc->cpu);
     }

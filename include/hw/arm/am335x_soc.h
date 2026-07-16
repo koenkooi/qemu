@@ -68,4 +68,12 @@ struct AM335xState {
     MemoryRegion sram;
 };
 
+/*
+ * am335x_bootrom.c: the boot ROM's SD card file-system boot (TRM SPRUH73Q
+ * 26.1.8.5). Reads the booting file "MLO" off the card's FAT partition;
+ * returns a g_malloc()ed buffer (size in *lenp) or NULL with errp set.
+ */
+uint8_t *am335x_bootrom_read_mlo(BlockBackend *blk, size_t *lenp,
+                                 Error **errp);
+
 #endif /* HW_ARM_AM335X_SOC_H */
