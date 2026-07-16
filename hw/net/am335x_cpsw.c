@@ -51,6 +51,13 @@
 #include "qemu/timer.h"
 #include "system/dma.h"
 #include "net/eth.h"
+#include "trace.h"
+
+/* Description string reported on the link/activity trace events, mirroring
+ * the "beaglebone-*" naming TYPE_LED instances use (hw/arm/beaglebone.c) so
+ * a host-side relay can key off it the same way. Only one external port is
+ * modelled, so this is a fixed literal rather than a per-instance property. */
+#define AM335X_CPSW_TRACE_DESC "beaglebone-eth0"
 
 /* --- CPSW subsystem (SS) block, CPSW2_* offsets (cpsw_priv.h) --------- */
 #define CPSW_SS_IDVER          0x000   /* must read CPSW_VERSION_2 */
@@ -278,6 +285,7 @@ static void cpsw_tx_process(AM335xCpswState *s, int ch)
         s->tx_pending[ch]++;
 
         if (mode & CPDMA_DESC_EOP) {
+            trace_am335x_cpsw_tx(AM335X_CPSW_TRACE_DESC, framelen);
             qemu_send_packet(qemu_get_queue(s->nic), frame, framelen);
             framelen = 0;
         }
@@ -614,6 +622,8 @@ static ssize_t cpsw_receive(NetClientState *nc, const uint8_t *buf,
     s->rx_pending[ch]++;
     cpsw_update_irq(s);
 
+    trace_am335x_cpsw_rx(AM335X_CPSW_TRACE_DESC, len);
+
     return size;
 }
 
@@ -621,6 +631,7 @@ static void cpsw_set_link(NetClientState *nc)
 {
     AM335xCpswState *s = qemu_get_nic_opaque(nc);
 
+    trace_am335x_cpsw_link_status(AM335X_CPSW_TRACE_DESC, !nc->link_down);
     lan9118_phy_update_link(&s->mii, nc->link_down);
 }
 
@@ -651,6 +662,8 @@ static void cpsw_reset(DeviceState *dev)
 
     /* The embedded PHY resets (and reports link) via the reset tree; make
      * the reported link match the netdev peer. */
+    trace_am335x_cpsw_link_status(AM335X_CPSW_TRACE_DESC,
+                                  !qemu_get_queue(s->nic)->link_down);
     lan9118_phy_update_link(&s->mii, qemu_get_queue(s->nic)->link_down);
 }
 

@@ -10,6 +10,11 @@ allwinner_sun8i_emac_set_link(bool active) "Set link: active=%u"
 allwinner_sun8i_emac_read(uint64_t offset, uint64_t val) "MMIO read: offset=0x%" PRIx64 " value=0x%" PRIx64
 allwinner_sun8i_emac_write(uint64_t offset, uint64_t val) "MMIO write: offset=0x%" PRIx64 " value=0x%" PRIx64
 
+# am335x_cpsw.c
+am335x_cpsw_link_status(const char *desc, bool up) "CPSW port desc:'%s' link %u"
+am335x_cpsw_rx(const char *desc, unsigned size) "CPSW port desc:'%s' RX %u bytes"
+am335x_cpsw_tx(const char *desc, unsigned size) "CPSW port desc:'%s' TX %u bytes"
+
 # lan9118_phy.c
 lan9118_phy_read(uint16_t val, int reg) "[0x%02x] -> 0x%04" PRIx16
 lan9118_phy_write(uint16_t val, int reg) "[0x%02x] <- 0x%04" PRIx16
