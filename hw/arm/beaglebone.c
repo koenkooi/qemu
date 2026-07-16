@@ -18,9 +18,11 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/datadir.h"
 #include "hw/boards.h"
 #include "hw/arm/am335x_soc.h"
 #include "hw/arm/boot.h"
+#include "hw/loader.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
 #include "hw/misc/led.h"
@@ -30,7 +32,147 @@
 #include "hw/display/tda19988.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "system/blockdev.h"
+#include "system/reset.h"
 #include "exec/address-spaces.h"
+
+/*
+ * "From-scratch" SD boot via -bios <MLO>. QEMU stands in for the AM335x
+ * boot ROM: it places the real TI SPL (MLO) at its SRAM entry point, seeds
+ * the handful of boot parameters the ROM leaves in SRAM, and starts the CPU
+ * there. SPL then does genuine EMIF-driven DDR3 init and reads u-boot.img
+ * off the SD card's FAT partition itself -- no -kernel/-dtb/-initrd needed.
+ *
+ * Addresses are the AM335x GP-device values from u-boot's
+ * arch/arm/include/asm/arch-am33xx/omap.h and asm/omap_common.h:
+ *   NON_SECURE_SRAM_START = 0x402F0400 (== CONFIG_SPL_TEXT_BASE, the ROM's
+ *                                       SPL download/run address)
+ *   NON_SECURE_SRAM_END   = 0x40310000
+ *
+ * The ROM passes the address of the boot-parameter struct to SPL in r0.
+ * SPL's save_boot_params (reached from the reset vector) stashes that r0 at
+ * OMAP_SRAM_SCRATCH_BOOT_PARAMS; save_omap_boot_params()
+ * (arch/arm/mach-omap2/boot-common.c) later reads it back, uses
+ * boot_device (offset 8) and follows boot_device_descriptor (offset 4)
+ * -> +DEVICE_DATA_OFFSET(0x18) -> +BOOT_MODE_OFFSET(0x8) for the boot mode.
+ * So we seed the struct/descriptor/device_data in SRAM scratch and hand r0
+ * to the CPU at reset -- we must NOT write the scratch pointer slot
+ * ourselves, since save_boot_params overwrites it from r0 first. We report
+ * BOOT_DEVICE_MMC1 (SD/MMC0) and MMCSD_MODE_FS so SPL loads u-boot.img from
+ * the FAT partition. All addresses lie in the reserved SRAM scratch band
+ * (0x4030B400..0x4030B800), which SPL's own image/BSS/stack
+ * (SP = 0x4030FF00) never touch this early.
+ */
+#define BBB_SRAM_START          0x402F0400
+#define BBB_SRAM_END            0x40310000
+#define BBB_BP_STRUCT           0x4030B430  /* omap_boot_parameters (-> r0) */
+#define BBB_BP_DESCRIPTOR       0x4030B450  /* boot_device_descriptor */
+#define BBB_BP_DEVICE_DATA      0x4030B470  /* device data */
+#define BBB_BOOT_DEVICE_MMC1    0x08        /* asm/arch-am33xx/spl.h */
+#define BBB_MMCSD_MODE_FS       2           /* include/spl.h */
+
+static struct arm_boot_info bbb_binfo = {
+    .loader_start = 0x80000000,
+    .board_id = -1,
+};
+
+/*
+ * Set the CPU's initial PC to the SPL entry. arm_load_kernel()'s firmware
+ * path deliberately leaves env->boot_info NULL (do_cpu_reset() then resets
+ * the CPU but does not touch the PC, since a -bios image normally sits at
+ * the 0x0 reset vector). MLO instead runs from internal SRAM, so we set the
+ * PC ourselves in a reset handler registered *after* arm_load_kernel(), so
+ * it runs after do_cpu_reset() and wins.
+ */
+static void bbb_firmware_reset(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    cpu_set_pc(CPU(cpu), bbb_binfo.entry);
+    /* The boot ROM passes the boot-parameter struct pointer to SPL in r0. */
+    cpu->env.regs[0] = BBB_BP_STRUCT;
+}
+
+/*
+ * Load the real TI SPL (MLO) the way the boot ROM would: strip the TI
+ * image header, place the SPL body at its GP-header load address in SRAM,
+ * and seed the ROM boot parameters. Sets bbb_binfo.firmware_loaded/entry.
+ */
+static void beaglebone_load_mlo(MachineState *machine)
+{
+    char *fw_path;
+    gchar *contents = NULL;
+    gsize len = 0;
+    GError *gerr = NULL;
+    uint32_t gp_off = 0;
+    uint32_t img_size, load_addr;
+    size_t body_len;
+    uint8_t bootparams[0x4C];
+
+    fw_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
+    if (!fw_path) {
+        error_report("Could not find MLO firmware image '%s'",
+                     machine->firmware);
+        exit(1);
+    }
+    if (!g_file_get_contents(fw_path, &contents, &len, &gerr)) {
+        error_report("Could not read MLO '%s': %s", fw_path, gerr->message);
+        exit(1);
+    }
+    g_free(fw_path);
+
+    /*
+     * The TI 'omapimage' MLO for a GP device starts with a 512-byte
+     * configuration header (TOC + CHSETTINGS); the 8-byte GP header (image
+     * size, load address) follows it. Detect the CH by its "CHSETTINGS"
+     * TOC entry name at offset 0x14; a bare GP image has the header at 0.
+     */
+    if (len >= 0x210 && memcmp(contents + 0x14, "CHSETTINGS", 10) == 0) {
+        gp_off = 0x200;
+    }
+    if (len < gp_off + 8) {
+        error_report("MLO '%s' too short for a GP header", machine->firmware);
+        exit(1);
+    }
+    img_size = ldl_le_p(contents + gp_off);
+    load_addr = ldl_le_p(contents + gp_off + 4);
+    body_len = len - gp_off - 8;
+    if (img_size && img_size < body_len) {
+        body_len = img_size;
+    }
+
+    if (load_addr < BBB_SRAM_START || load_addr >= BBB_SRAM_END) {
+        error_report("MLO load address 0x%08x is outside AM335x internal SRAM",
+                     load_addr);
+        exit(1);
+    }
+
+    rom_add_blob_fixed("am335x.mlo", contents + gp_off + 8, body_len,
+                       load_addr);
+    g_free(contents);
+
+    /*
+     * Seed the ROM boot parameters (see the layout comment above). The blob
+     * base is the omap_boot_parameters struct (what r0 points at); byte
+     * offsets are just the target SRAM address minus BBB_BP_STRUCT. The
+     * scratch pointer slot (0x4030B424) is intentionally not written here --
+     * SPL's save_boot_params fills it from r0.
+     */
+#define BP_OFF(addr) ((addr) - BBB_BP_STRUCT)
+    memset(bootparams, 0, sizeof(bootparams));
+    /* struct: reserved(+0)=0, boot_device_descriptor(+4), boot_device(+8). */
+    stl_le_p(bootparams + BP_OFF(BBB_BP_STRUCT + 4), BBB_BP_DESCRIPTOR);
+    bootparams[BP_OFF(BBB_BP_STRUCT + 8)] = BBB_BOOT_DEVICE_MMC1;
+    /* descriptor: +DEVICE_DATA_OFFSET(0x18) -> device data. */
+    stl_le_p(bootparams + BP_OFF(BBB_BP_DESCRIPTOR + 0x18), BBB_BP_DEVICE_DATA);
+    /* device data: +BOOT_MODE_OFFSET(0x8) = MMCSD_MODE_FS. */
+    stl_le_p(bootparams + BP_OFF(BBB_BP_DEVICE_DATA + 0x8), BBB_MMCSD_MODE_FS);
+#undef BP_OFF
+    rom_add_blob_fixed("am335x.bootparams", bootparams, sizeof(bootparams),
+                       BBB_BP_STRUCT);
+
+    bbb_binfo.entry = load_addr;
+    bbb_binfo.firmware_loaded = true;
+}
 
 /* On-board USR LED descriptions, keyed by GPIO1 line 21..24. These strings
  * are the identifiers a host relay matches to drive the board UI. */
@@ -39,21 +181,10 @@ static const char * const bbb_usr_led_desc[4] = {
     "beaglebone-usr2", "beaglebone-usr3",
 };
 
-static struct arm_boot_info bbb_binfo = {
-    .loader_start = 0x80000000,
-    .board_id = -1,
-};
-
 static void beaglebone_init(MachineState *machine)
 {
     AM335xState *soc;
     int i;
-
-    /* BIOS is not supported by this board */
-    if (machine->firmware) {
-        error_report("BIOS not supported for this machine");
-        exit(1);
-    }
 
     soc = AM335X_SOC(object_new(TYPE_AM335X_SOC));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
@@ -158,8 +289,23 @@ static void beaglebone_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0x80000000,
                                 machine->ram);
 
+    /*
+     * -bios <MLO>: boot the genuine SPL -> u-boot -> extlinux chain off the
+     * SD card, with no QEMU-side kernel injection. Additive to (and mutually
+     * exclusive at runtime with) the -kernel direct-Linux-boot path, which
+     * is unchanged.
+     */
+    if (machine->firmware) {
+        beaglebone_load_mlo(machine);
+    }
+
     bbb_binfo.ram_size = machine->ram_size;
     arm_load_kernel(&soc->cpu, machine, &bbb_binfo);
+
+    if (machine->firmware) {
+        /* Runs after arm_load_kernel()'s do_cpu_reset(); sets PC to MLO. */
+        qemu_register_reset(bbb_firmware_reset, &soc->cpu);
+    }
 }
 
 static void beaglebone_machine_init(MachineClass *mc)
