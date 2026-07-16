@@ -60,6 +60,7 @@
 #include "qemu/error-report.h"
 #include "hw/boards.h"
 #include "hw/arm/am335x_soc.h"
+#include "hw/arm/am335x_bootflow.h"
 #include "hw/arm/boot.h"
 #include "hw/qdev-properties.h"
 #include "hw/sd/sd.h"
@@ -88,12 +89,6 @@ static void beaglebone_white_init(MachineState *machine)
 {
     AM335xState *soc;
     int i;
-
-    /* BIOS is not supported by this board */
-    if (machine->firmware) {
-        error_report("BIOS not supported for this machine");
-        exit(1);
-    }
 
     soc = AM335X_SOC(object_new(TYPE_AM335X_SOC));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
@@ -165,8 +160,41 @@ static void beaglebone_white_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0x80000000,
                                 machine->ram);
 
+    /*
+     * Three mutually exclusive boot paths, in priority order (same as
+     * beaglebone.c's Black variant; see that file for the detailed
+     * rationale):
+     *
+     *  -kernel: direct Linux boot, handled by arm_load_kernel() below.
+     *  -bios <MLO>: boot the genuine SPL -> u-boot -> extlinux chain off
+     *      the SD card, with no QEMU-side kernel injection.
+     *  neither, with an SD card: what the real board does from a cold
+     *      start -- the boot ROM finds MLO on the card's FAT partition
+     *      itself (TRM SPRUH73Q 26.1.8.5) and everything proceeds as in
+     *      the -bios case.
+     *
+     * White has no onboard eMMC (see file comment above), so unlike Black
+     * there is only ever one candidate boot drive: MMC0 / IF_SD index 0,
+     * the same drive already attached above.
+     */
+    if (machine->firmware) {
+        am335x_boot_load_mlo(machine, &bbw_binfo);
+    } else if (!machine->kernel_filename) {
+        DriveInfo *di = drive_get(IF_SD, 0, 0);
+        BlockBackend *blk = di ? blk_by_legacy_dinfo(di) : NULL;
+
+        if (blk) {
+            am335x_boot_from_sd(blk, &bbw_binfo);
+        }
+    }
+
     bbw_binfo.ram_size = machine->ram_size;
     arm_load_kernel(&soc->cpu, machine, &bbw_binfo);
+
+    if (bbw_binfo.firmware_loaded) {
+        /* Runs after arm_load_kernel()'s do_cpu_reset(); sets PC to MLO. */
+        am335x_boot_register_firmware_reset(&soc->cpu, &bbw_binfo);
+    }
 }
 
 static void beaglebone_white_machine_init(MachineClass *mc)
