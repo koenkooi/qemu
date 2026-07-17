@@ -28,3 +28,7 @@ config AM335X_HSMMC
     bool
     select SDHCI
     select SD
+
+config WL18XX_SDIO
+    bool
+    select SD

@@ -58,124 +58,15 @@
 
 #define INVALID_ADDRESS     UINT32_MAX
 
-typedef enum {
-    sd_r0 = 0,    /* no response */
-    sd_r1,        /* normal response command */
-    sd_r2_i,      /* CID register */
-    sd_r2_s,      /* CSD register */
-    sd_r3,        /* OCR register */
-    sd_r6 = 6,    /* Published RCA response */
-    sd_r7,        /* Operating voltage */
-    sd_r1b = -1,
-    sd_illegal = -2,
-} sd_rsp_type_t;
-
-typedef enum {
-    sd_spi,
-    sd_bc,     /* broadcast -- no response */
-    sd_bcr,    /* broadcast with response */
-    sd_ac,     /* addressed -- no data transfer */
-    sd_adtc,   /* addressed with data transfer */
-} sd_cmd_type_t;
-
-enum SDCardModes {
-    sd_inactive,
-    sd_card_identification_mode,
-    sd_data_transfer_mode,
-};
-
-enum SDCardStates {
-    sd_waitirq_state        = -2, /* emmc */
-    sd_inactive_state       = -1,
-
-    sd_idle_state           = 0,
-    sd_ready_state          = 1,
-    sd_identification_state = 2,
-    sd_standby_state        = 3,
-    sd_transfer_state       = 4,
-    sd_sendingdata_state    = 5,
-    sd_receivingdata_state  = 6,
-    sd_programming_state    = 7,
-    sd_disconnect_state     = 8,
-    sd_bus_test_state       = 9,  /* emmc */
-    sd_sleep_state          = 10, /* emmc */
-    sd_io_state             = 15  /* sd */
-};
-
-#define SDMMC_CMD_MAX 64
-
-typedef sd_rsp_type_t (*sd_cmd_handler)(SDState *sd, SDRequest req);
-
-typedef struct SDProto {
-    const char *name;
-    struct {
-        const unsigned class;
-        const sd_cmd_type_t type;
-        const char *name;
-        sd_cmd_handler handler;
-    } cmd[SDMMC_CMD_MAX], acmd[SDMMC_CMD_MAX];
-} SDProto;
-
-struct SDState {
-    DeviceState parent_obj;
-
-    /* SD Memory Card Registers */
-    uint32_t ocr;
-    uint8_t scr[8];
-    uint8_t cid[16];
-    uint8_t csd[16];
-    uint16_t rca;
-    uint32_t card_status;
-    uint8_t sd_status[64];
-    union {
-        uint8_t ext_csd[512];
-        struct {
-            uint8_t ext_csd_rw[192]; /* Modes segment */
-            uint8_t ext_csd_ro[320]; /* Properties segment */
-        };
-    };
-
-    /* Static properties */
-
-    uint8_t spec_version;
-    uint64_t boot_part_size;
-    BlockBackend *blk;
-    uint8_t boot_config;
-
-    const SDProto *proto;
-
-    /* Runtime changeables */
-
-    uint32_t mode;    /* current card mode, one of SDCardModes */
-    int32_t state;    /* current card state, one of SDCardStates */
-    uint32_t vhs;
-    bool wp_switch;
-    unsigned long *wp_group_bmap;
-    int32_t wp_group_bits;
-    uint64_t size;
-    uint32_t blk_len;
-    uint32_t multi_blk_cnt;
-    uint32_t erase_start;
-    uint32_t erase_end;
-    uint8_t pwd[16];
-    uint32_t pwd_len;
-    uint8_t function_group[6];
-    uint8_t current_cmd;
-    const char *last_cmd_name;
-    /* True if we will handle the next command as an ACMD. Note that this does
-     * *not* track the APP_CMD status bit!
-     */
-    bool expecting_acmd;
-    uint32_t blk_written;
-
-    uint64_t data_start;
-    uint32_t data_offset;
-    size_t data_size;
-    uint8_t data[512];
-    QEMUTimer *ocr_power_timer;
-    uint8_t dat_lines;
-    bool cmd_line;
-};
+/*
+ * SDState, SDProto, sd_cmd_handler and the SD response/command/mode/state
+ * enums were moved verbatim (no behavioural change) into sdmmc-internal.h, so
+ * a sibling SD-bus card model can subclass TYPE_SDMMC_COMMON and embed an
+ * SDState. The first such user is hw/sd/wl18xx_sdio.c, the TI WiLink8
+ * (wl1835) SDIO WiFi function on the BeagleBone Green Wireless, which needs
+ * the SDState layout to sit on the shared "sd-bus" the way sd-card/emmc do
+ * (hw/sd/core.c's get_card() casts every bus child with SDMMC_COMMON()).
+ */
 
 static void sd_realize(DeviceState *dev, Error **errp);
 

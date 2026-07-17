@@ -73,3 +73,8 @@ pl181_data_engine_idle(void) "data engine idle"
 # aspeed_sdhci.c
 aspeed_sdhci_read(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
 aspeed_sdhci_write(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
+
+# wl18xx_sdio.c
+wl18xx_sdio_command(uint8_t cmd, uint32_t arg) "CMD%02d arg 0x%08x"
+wl18xx_sdio_cmd52(const char *rw, int fn, uint32_t addr, uint8_t data, uint8_t out) "%s fn%d addr 0x%05x data 0x%02x -> 0x%02x"
+wl18xx_sdio_cmd53(const char *rw, int fn, uint32_t addr, const char *mode, int incr, uint32_t len) "%s fn%d addr 0x%05x %s incr %d len %u"
