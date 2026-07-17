@@ -80,6 +80,22 @@
  * USB controller activity. */
 #define AM335X_USBSS_BASE       0x47400000
 
+/*
+ * EDMA3 (TRM spruh73q ch.11). TPCC (Third-Party Channel Controller, the
+ * user-facing DMA block) @ 0x49000000; INTC lines 12/13/14 = EDMACOMPINT/
+ * EDMAMPERR/EDMAERRINT (TRM Table 6-1; DT target-module@49000000 interrupts
+ * <12 13 14>). The three Transfer Controllers (TPTC0/1/2) @ 0x49800000/
+ * 0x49900000/0x49A00000 (1MB each) are register-file stubs -- the mainline
+ * edma tptc driver touches no TPTC registers (edma.c edma_tptc_probe). */
+#define AM335X_EDMA_BASE        0x49000000
+#define AM335X_IRQ_EDMA_COMP    12
+#define AM335X_IRQ_EDMA_MPERR   13
+#define AM335X_IRQ_EDMA_ERR     14
+#define AM335X_EDMA_TPTC0_BASE  0x49800000
+#define AM335X_EDMA_TPTC1_BASE  0x49900000
+#define AM335X_EDMA_TPTC2_BASE  0x49A00000
+#define AM335X_EDMA_TPTC_SIZE   0x100000
+
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
  * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
@@ -174,6 +190,7 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "lcdc", &s->lcdc, TYPE_AM335X_LCDC);
     object_initialize_child(obj, "cpsw", &s->cpsw, TYPE_AM335X_CPSW);
     object_initialize_child(obj, "usbss", &s->usbss, TYPE_AM335X_USBSS);
+    object_initialize_child(obj, "edma", &s->edma, TYPE_AM335X_EDMA);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -403,6 +420,39 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->usbss), 0, AM335X_USBSS_BASE);
+
+    /*
+     * EDMA3 channel controller (TPCC) @ 0x49000000. A real device so the
+     * mainline ti,edma3-tpcc dmaengine driver probes and provides DMA
+     * channels to its clients -- most importantly McASP0, whose davinci-mcasp
+     * driver otherwise fails with "No DMA controller found". Completion line
+     * 12 drives cyclic-audio-playback progress; error line 14 is wired but
+     * never asserted, and the mem-protect line 13 is not requested by Linux.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->edma), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->edma), 0, AM335X_EDMA_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->edma), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_EDMA_COMP));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->edma), 1,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_EDMA_MPERR));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->edma), 2,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_EDMA_ERR));
+
+    /*
+     * EDMA3 Transfer Controllers TPTC0/1/2. Register-file stubs (see the
+     * address-define comment): the ti,edma3-tptc driver touches none of their
+     * registers, and the ti-sysc wrapper needs only a readable REV plus to
+     * have its SYSC softreset write absorbed (no reset-done poll, so no
+     * boot stall).
+     */
+    create_unimplemented_device("edma-tptc0", AM335X_EDMA_TPTC0_BASE,
+                                AM335X_EDMA_TPTC_SIZE);
+    create_unimplemented_device("edma-tptc1", AM335X_EDMA_TPTC1_BASE,
+                                AM335X_EDMA_TPTC_SIZE);
+    create_unimplemented_device("edma-tptc2", AM335X_EDMA_TPTC2_BASE,
+                                AM335X_EDMA_TPTC_SIZE);
 
     /*
      * Placeholders for peripherals that become real devices in later

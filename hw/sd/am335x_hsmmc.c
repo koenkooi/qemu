@@ -52,6 +52,22 @@
 #define SD_SYSSTATUS_RESETDONE  BIT(0)  /* reset complete (always 1 here) */
 
 /*
+ * SD_HL_HWINFO.MADMA_EN (bit0): "the controller has an integrated ADMA master".
+ * The mainline sdhci-omap driver reads this bit (sdhci_omap_has_adma(),
+ * sdhci-omap.c:731-738) and, only if it is *clear*, switches MMC data transfer
+ * to an external EDMA channel (sdhci_switch_external_dma(), sdhci-omap.c:1327).
+ * Real AM335x MMCHS reports 0 here and therefore uses EDMA -- but this tree's
+ * EDMA3 model (hw/dma/am335x_edma.c) is deliberately scoped to McASP and moves
+ * no MMC data. The embedded SD Host Standard core, by contrast, does implement
+ * ADMA2 (advertised in AM335X_HSMMC_CAPAB) and the internal path QEMU already
+ * drives correctly. So we report MADMA_EN=1: sdhci-omap keeps using that
+ * working internal ADMA engine (exactly as it did before EDMA3 was modelled)
+ * instead of routing SD/eMMC transfers through the data-less EDMA model. This
+ * is the documented MMC-side boundary of the EDMA model's generality.
+ */
+#define SD_HL_HWINFO_MADMA_EN   BIT(0)
+
+/*
  * Capabilities advertised by the embedded SD Host Standard core.
  *
  * 0x057834b4 is the generic-sdhci reset default (and the value fsl-imx6
@@ -81,6 +97,11 @@ static uint64_t am335x_hsmmc_wrap_read(void *opaque, hwaddr addr,
     case SD_SYSSTATUS:
         /* Software reset is instantaneous in the model. */
         return SD_SYSSTATUS_RESETDONE;
+    case SD_HL_HWINFO:
+        /* Report an integrated ADMA master so sdhci-omap uses the embedded
+         * core's ADMA rather than the (data-less) EDMA3 model (see the
+         * SD_HL_HWINFO_MADMA_EN comment above). */
+        return SD_HL_HWINFO_MADMA_EN;
     default:
         return s->wrap_regs[addr >> 2];
     }
