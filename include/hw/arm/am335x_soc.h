@@ -35,6 +35,7 @@
 #include "hw/net/am335x_cpsw.h"
 #include "hw/misc/am335x_usbss.h"
 #include "hw/dma/am335x_edma.h"
+#include "hw/audio/am335x_mcasp.h"
 #include "qom/object.h"
 
 #define TYPE_AM335X_SOC "am335x-soc"
@@ -66,6 +67,7 @@ struct AM335xState {
     AM335xCpswState cpsw;
     AM335xUsbssState usbss;
     AM335xEdmaState edma;
+    AM335xMcaspState mcasp0;
     MemoryRegion ocmc;
     MemoryRegion sram;
 };

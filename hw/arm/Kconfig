@@ -63,6 +63,7 @@ config BEAGLEBONE
     select AM335X_CPSW
     select AM335X_USBSS
     select AM335X_EDMA
+    select AM335X_MCASP
     select TDA19988
     select AT24C
     select TPS65217_PMU
@@ -88,6 +89,7 @@ config BEAGLEBONE_WHITE
     select AM335X_CPSW
     select AM335X_USBSS
     select AM335X_EDMA
+    select AM335X_MCASP
     select AT24C
     select TPS65217_PMU
     select LED
@@ -112,6 +114,7 @@ config BEAGLEBONE_ENHANCED
     select AM335X_CPSW
     select AM335X_USBSS
     select AM335X_EDMA
+    select AM335X_MCASP
     select TDA19988
     select AT24C
     select TPS65217_PMU
@@ -137,6 +140,7 @@ config BEAGLEBONE_GREEN_ECO
     select AM335X_CPSW
     select AM335X_USBSS
     select AM335X_EDMA
+    select AM335X_MCASP
     select AT24C
     select TPS65214_PMU
     select LED
@@ -161,6 +165,7 @@ config BEAGLEBONE_GREEN_WIRELESS
     select AM335X_CPSW
     select AM335X_USBSS
     select AM335X_EDMA
+    select AM335X_MCASP
     select WL18XX_SDIO
     select AT24C
     select TPS65217_PMU

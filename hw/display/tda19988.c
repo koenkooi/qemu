@@ -73,16 +73,23 @@
  * way "-device tda19988,connected=false" would at machine construction.
  * See tda19988_set_connected().
  *
- * Out of scope: HDMI audio. The kernel's davinci-mcasp driver
- * (48038000.mcasp) fails to probe today with "No DMA controller found"
- * because this tree models neither the AM335x McASP I2S peripheral nor the
- * EDMA3 DMA controller it needs a channel from. Adding it later means: (1) an
- * am335x_mcasp.c serial-port/FIFO model, (2) an EDMA3 controller model (TRM
- * spruh73q ch.11) wired as the McASP's DMA engine, (3) a QEMU audiodev
- * backend the McASP model drains PCM frames into, and (4) extending this
- * TDA19988 model with its S/PDIF-in "audio-ports" I2S sink (the "sound-dai =
- * <&tda19988>" ASoC link in the DT) so aplay/speaker-test on the guest
- * produces sound. None of that is implemented here.
+ * HDMI audio: McASP0 (hw/audio/am335x_mcasp.c) and EDMA3 (hw/dma/am335x_edma.c)
+ * now model enough of the DMA-driven I2S chain for davinci-mcasp to probe
+ * cleanly and the DT's `simple-audio-card` ("TI BeagleBone Black") to
+ * register -- confirmed via a live boot: `modprobe snd-soc-davinci-mcasp`
+ * succeeds and /proc/asound/cards lists the card, with TDA19988 bound as the
+ * ASoC codec DAI. Notably, THIS file needed no changes for that: the kernel's
+ * tda998x_drv.c already implements its own ASoC codec-DAI glue in software
+ * (probe/hw_params/etc. do not depend on any TDA19988 register beyond what is
+ * already modelled for DRM/CEC above), so the codec side of the audio link
+ * resolves for free once McASP0/EDMA3 exist. What remains structural/unverified:
+ * no real I2S sample data is transported -- McASP0's "dat" data-port window
+ * discards writes and reads zero (see am335x_mcasp.c), and EDMA3's
+ * completion-interrupt cadence is a synthetic timer, not driven by any real
+ * McASP FIFO/sample-clock event -- so nothing audible reaches this model's
+ * (nonexistent) audio-in path, and an actual aplay/speaker-test playback
+ * completing end-to-end was not exercised (the test rootfs used lacks
+ * alsa-utils and there was no way to build/install it offline).
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as

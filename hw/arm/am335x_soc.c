@@ -96,6 +96,16 @@
 #define AM335X_EDMA_TPTC2_BASE  0x49A00000
 #define AM335X_EDMA_TPTC_SIZE   0x100000
 
+/*
+ * McASP0 audio serial port (TRM spruh73q ch.22). Config ("mpu") registers @
+ * 0x48038000 (8KB) and the data port ("dat") @ 0x46000000 (4MB); INTC lines
+ * 80/81 = tx/rx (DT mcasp0 interrupts <80 81>). DMA-driven off EDMA3 -- feeds
+ * the on-board TDA19988 HDMI encoder as the ALSA simple-audio-card CPU DAI. */
+#define AM335X_MCASP0_MPU_BASE  0x48038000
+#define AM335X_MCASP0_DAT_BASE  0x46000000
+#define AM335X_IRQ_MCASP0_TX    80
+#define AM335X_IRQ_MCASP0_RX    81
+
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
  * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
@@ -191,6 +201,7 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "cpsw", &s->cpsw, TYPE_AM335X_CPSW);
     object_initialize_child(obj, "usbss", &s->usbss, TYPE_AM335X_USBSS);
     object_initialize_child(obj, "edma", &s->edma, TYPE_AM335X_EDMA);
+    object_initialize_child(obj, "mcasp0", &s->mcasp0, TYPE_AM335X_MCASP);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -453,6 +464,23 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                                 AM335X_EDMA_TPTC_SIZE);
     create_unimplemented_device("edma-tptc2", AM335X_EDMA_TPTC2_BASE,
                                 AM335X_EDMA_TPTC_SIZE);
+
+    /*
+     * McASP0 audio serial port: config window @ 0x48038000 and data port @
+     * 0x46000000, INTC lines 80/81 (tx/rx). With EDMA3 above providing its DMA
+     * channel, davinci-mcasp probes, snd_soc registers the simple-audio-card,
+     * and playback DMA can run (completions come from EDMA). The tx/rx lines
+     * are error-only (under/overrun) and never asserted by the model.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mcasp0), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mcasp0), 0, AM335X_MCASP0_MPU_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mcasp0), 1, AM335X_MCASP0_DAT_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->mcasp0), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_MCASP0_TX));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->mcasp0), 1,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_MCASP0_RX));
 
     /*
      * Placeholders for peripherals that become real devices in later
