@@ -29,6 +29,7 @@ arm_ss.add(when: 'CONFIG_BEAGLEBONE', if_true: files('am335x_soc.c', 'am335x_boo
 arm_ss.add(when: 'CONFIG_BEAGLEBONE_WHITE', if_true: files('beaglebone-white.c'))
 arm_ss.add(when: 'CONFIG_BEAGLEBONE_ENHANCED', if_true: files('beaglebone-enhanced.c'))
 arm_ss.add(when: 'CONFIG_BEAGLEBONE_GREEN_ECO', if_true: files('beaglebone-green-eco.c'))
+arm_ss.add(when: 'CONFIG_BEAGLEBONE_GREEN_WIRELESS', if_true: files('beaglebone-green-wireless.c'))
 arm_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-h3.c', 'orangepi.c'))
 arm_ss.add(when: 'CONFIG_ALLWINNER_R40', if_true: files('allwinner-r40.c', 'bananapi_m2u.c'))
 arm_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2836.c', 'raspi.c'))

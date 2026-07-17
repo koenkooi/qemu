@@ -138,6 +138,30 @@ config BEAGLEBONE_GREEN_ECO
     select LED
     select UNIMP
 
+config BEAGLEBONE_GREEN_WIRELESS
+    bool
+    default y
+    depends on TCG && ARM
+    select AM335X_INTC
+    select AM335X_TIMER
+    select AM335X_PRCM
+    select AM335X_WDT
+    select AM335X_CONTROL
+    select AM335X_EMIF
+    select AM335X_GPIO
+    select AM335X_HSMMC
+    select AM335X_UART
+    select AM335X_I2C
+    select AM335X_RTC
+    select AM335X_LCDC
+    select AM335X_CPSW
+    select AM335X_USBSS
+    select WL18XX_SDIO
+    select AT24C
+    select TPS65217_PMU
+    select LED
+    select UNIMP
+
 config DIGIC
     bool
     default y
