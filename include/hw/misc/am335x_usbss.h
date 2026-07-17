@@ -13,13 +13,15 @@
  *   0x1400 USB0 "mc" musb-core         | file (peripheral/OTG, out of scope)
  *   0x1800 USB1 "control" wrapper      | modelled as a functional
  *   0x1c00 USB1 "mc" musb-core         | host controller (see am335x_usbss.c)
- *   0x2000 CPPI4.1 DMA glue/queue-mgr  (out of scope, flat store)
+ *   0x2000 CPPI4.1 DMA controller/sched (probe-time flat store)
+ *   0x4000 CPPI4.1 DMA queue-manager   (functional submit/completion path)
  *
  * USB1 is the board's type-A host port. It is modelled well enough for the
  * real musb-hdrc host stack to enumerate a device attached to its USBPort
- * (`-device usb-...`) over PIO -- control + bulk/interrupt transfers, no
- * CPPI4.1 DMA (the guest must load musb_hdrc with use_dma=0). USB0 and the
- * CPPI DMA engine remain clean-probe stubs.
+ * (`-device usb-...`) and move bulk/interrupt data -- both over PIO and,
+ * with the guest's default use_dma=true, over a functional CPPI4.1 DMA data
+ * path (queue-manager submit -> transfer -> completion, INTC 17). USB0
+ * remains a clean-probe stub and its CPPI channels stay inert.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -86,6 +88,23 @@ typedef struct AM335xMusbHalf {
     uint8_t   fifo[AM335X_MUSB_FIFO_SIZE];
     uint32_t  fifo_len;     /* valid bytes                                  */
     uint32_t  fifo_rd;      /* drain cursor                                 */
+
+    /*
+     * CPPI4.1 DMA-driven transfer state. Set when this half's in-flight
+     * transfer was armed by a queue-manager descriptor push (default
+     * use_dma=true) rather than a FIFO/CSR poke: the data moves between the
+     * guest DMA buffer (cppi_buf_phys) and the USB endpoint via cppi_buf
+     * instead of the PIO fifo, and completion posts a descriptor onto the
+     * endpoint's CPPI completion queue + raises the USBSS PD_COMP interrupt.
+     */
+    bool      cppi;             /* in-flight transfer is CPPI-driven        */
+    uint32_t  cppi_desc_phys;   /* descriptor guest phys (for write-back)   */
+    uint32_t  cppi_buf_phys;    /* data buffer guest phys (pd4)             */
+    uint32_t  cppi_pd0;         /* descriptor pd0 (type|len) as submitted   */
+    uint32_t  cppi_req_len;     /* requested transfer length                */
+    uint16_t  cppi_qcomp;       /* completion queue number                  */
+    uint8_t  *cppi_buf;         /* bounce buffer (grown to cppi_req_len)    */
+    uint32_t  cppi_buf_cap;     /* allocated size of cppi_buf               */
 } AM335xMusbHalf;
 
 /* Per-endpoint musb-core register state (host mode). */
@@ -153,6 +172,53 @@ typedef struct AM335xMusb {
     bool     connected;         /* CONNECT signalled for the attached dev  */
 } AM335xMusb;
 
+/*
+ * CPPI4.1 queue-manager completion model. On a submit-queue push the model
+ * decodes the 8-word host descriptor, moves the buffer through the USB1
+ * endpoint, then posts the descriptor onto the endpoint's completion queue
+ * so the guest's cppi41_pop_desc()/cppi41_irq() drain it. The am335x queue
+ * tables (drivers/dma/ti/cppi41.c:155-225) use queue numbers up to 155; a
+ * small per-queue ring holds descriptors posted to a completion (or the
+ * teardown-complete) queue until the guest pops them via QMGR_QUEUE_D.
+ */
+#define AM335X_CPPI_NUM_QUEUES 156
+#define AM335X_CPPI_CQ_DEPTH   8
+#define AM335X_CPPI_COMP_RING  64
+
+typedef struct AM335xCppiCq {
+    uint32_t desc[AM335X_CPPI_CQ_DEPTH];
+    uint8_t  head;
+    uint8_t  tail;
+    uint8_t  count;
+} AM335xCppiCq;
+
+/* A finished transfer awaiting completion-queue posting from the bottom half. */
+typedef struct AM335xCppiComp {
+    uint16_t q;
+    uint32_t desc;
+} AM335xCppiComp;
+
+typedef struct AM335xCppi {
+    uint32_t irq_status;    /* USBSS_IRQ_STATUS  (glue+0x28): PD_COMP=bit2  */
+    uint32_t irq_enable;    /* USBSS_IRQ_ENABLER/CLEARR (glue+0x2c/0x30)    */
+    uint32_t td_desc_phys;  /* teardown descriptor last pushed to queue 31  */
+    AM335xCppiCq cq[AM335X_CPPI_NUM_QUEUES];
+
+    /*
+     * Completions are posted (queue + PD_COMP IRQ) from a bottom half, not
+     * inline from the transfer's finish: a CPPI RX transfer's completion IRQ
+     * makes the guest reload the next packet, whose submit can complete
+     * synchronously and would otherwise re-post the IRQ *while the guest is
+     * still inside cppi41_irq* -- the dsps callback clears PD_COMP mid-ISR,
+     * so an inline re-raise races the interrupt-controller ack and is lost.
+     * Deferring to the main loop serialises each reload iteration cleanly.
+     */
+    AM335xCppiComp comp[AM335X_CPPI_COMP_RING];
+    uint8_t  comp_head;
+    uint8_t  comp_tail;
+    uint8_t  comp_count;
+} AM335xCppi;
+
 struct AM335xUsbssState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -162,13 +228,17 @@ struct AM335xUsbssState {
     MemoryRegion glue;          /* flat store, priority 0                 */
     MemoryRegion musb_ctrl;     /* USB1 wrapper, priority 1               */
     MemoryRegion musb_mc;       /* USB1 musb-core, priority 1             */
+    MemoryRegion cppi_ctrl;     /* CPPI DMA controller window, priority 1 */
+    MemoryRegion cppi_qmgr;     /* CPPI queue-manager window, priority 1  */
 
     /*
-     * Per-instance musb "mc" interrupt outputs -> INTC 18 (USB0)/19 (USB1).
-     * irq[1] (USB1) is driven from the wrapper interrupt-status registers
-     * by the functional host model; irq[0] (USB0) stays idle.
+     * Interrupt outputs. irq[0]/irq[1] are the per-instance musb "mc" lines
+     * -> INTC 18 (USB0)/19 (USB1); irq[1] (USB1) is driven from the wrapper
+     * interrupt-status registers by the functional host model, irq[0] (USB0)
+     * stays idle. irq[2] is the CPPI4.1 DMA completion ("glue") line -> INTC
+     * 17, asserted while USBSS_IRQ_STATUS.PD_COMP is pending+enabled.
      */
-    qemu_irq irq[2];
+    qemu_irq irq[3];
 
     /*
      * Flat, byte-addressable backing store for the whole window (glue).
@@ -180,6 +250,10 @@ struct AM335xUsbssState {
 
     /* USB1 functional host controller. */
     AM335xMusb musb;
+
+    /* CPPI4.1 DMA queue-manager completion state (USB1 endpoints). */
+    AM335xCppi cppi;
+    QEMUBH *cppi_comp_bh;       /* drains cppi.comp[] -> completion queues */
 };
 
 #endif /* HW_MISC_AM335X_USBSS_H */

@@ -25,21 +25,31 @@
  * -----
  * USB1 (the board's type-A host connector) is modelled as a *functional*
  * host controller: a real USBBus/USBPort, the 16-endpoint indexed
- * CSR/FIFO register file, the DSPS wrapper interrupt plumbing, and PIO
- * (no-DMA) control + bulk/interrupt transfer handling -- enough for the
- * real drivers/usb/musb host stack to enumerate a device plugged into the
- * port (`-device usb-...`) and bind its class driver. USB0 (the OTG port)
- * and the CPPI4.1 DMA engine stay clean-probe register-file stubs: USB0
- * comes up as an idle peripheral/host that never sees a connect, and CPPI
- * reads back as zero (the guest must load musb_hdrc with use_dma=0, else
- * musb_dma_controller_create() -- musb_core.c:2473 -- tries to grab CPPI
- * channels this model does not provide).
+ * CSR/FIFO register file, the DSPS wrapper interrupt plumbing, PIO control +
+ * bulk/interrupt transfer handling, AND a functional CPPI4.1 DMA data path
+ * so the guest's *default* use_dma=true works: devices enumerate and move
+ * bulk/interrupt data with no `musb_hdrc.use_dma=0` override. USB0 (the OTG
+ * port) stays a clean-probe register-file stub (an idle peripheral/host that
+ * never sees a connect), and its 15+15 CPPI channels stay inert.
  *
  * Layout: a 32KB container holds a flat "glue" store (priority 0) covering
  * the whole window, with the USB1 "control" (0x1800) and "mc" (0x1c00)
- * sub-windows overlaid as higher-priority functional MMIO regions. USB0's
- * clean-probe revision/CONFIGDATA and the ti-sysc/USB0 soft-reset bits are
- * served by the glue store exactly as before.
+ * sub-windows and the CPPI4.1 queue-manager (0x4000) overlaid as higher-
+ * priority functional MMIO regions. USB0's clean-probe revision/CONFIGDATA,
+ * the ti-sysc/USB0 soft-reset bits, and the CPPI controller/scheduler
+ * probe-time registers are served by the flat glue store as before.
+ *
+ * The CPPI4.1 DMA data path (drivers/dma/ti/cppi41.c + musb_cppi41.c)
+ * ----------------------------------------------------------------
+ * With use_dma=true, musb_ep_program() routes every EP1-15 bulk/interrupt
+ * transfer through CPPI and bypasses the PIO FIFO. The provider builds an
+ * 8-word host descriptor in guest DMA memory and pushes its physical address
+ * onto the endpoint's submit queue (a QMGR_QUEUE_D write); this model decodes
+ * it, moves the buffer through the USB1 endpoint with the same
+ * usb_handle_packet() plumbing as the PIO engine, writes the transferred
+ * length back into the descriptor, and posts it onto the endpoint's
+ * completion queue -- raising USBSS_IRQ_STATUS.PD_COMP (INTC 17). See the
+ * "CPPI4.1 DMA" section below.
  *
  * The DSPS wrapper interrupt model (the load-bearing subtlety)
  * -----------------------------------------------------------
@@ -76,6 +86,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/usb.h"
+#include "system/dma.h"
 #include "qemu/bitops.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
@@ -188,10 +199,12 @@
 
 /* TXCSR / RXCSR, host mode. */
 #define MUSB_TXCSR_MODE        0x2000
+#define MUSB_TXCSR_DMAENAB     0x1000
 #define MUSB_TXCSR_H_RXSTALL   0x0020
 #define MUSB_TXCSR_H_ERROR     0x0004
 #define MUSB_TXCSR_TXPKTRDY    0x0001
 
+#define MUSB_RXCSR_DMAENAB     0x2000
 #define MUSB_RXCSR_H_RXSTALL   0x0040
 #define MUSB_RXCSR_H_REQPKT    0x0020
 #define MUSB_RXCSR_DATAERROR   0x0008
@@ -230,6 +243,65 @@
  */
 #define AM335X_MUSB_NAK_RETRY_NS   8000000  /* 8ms  */
 #define AM335X_MUSB_WAKE_RETRY_NS   125000  /* 125us */
+
+/* ======================================================================= */
+/* CPPI4.1 DMA (drivers/dma/ti/cppi41.c + drivers/usb/musb/musb_cppi41.c).  */
+/*
+ * The USBSS window carries the CPPI4.1 glue/controller/scheduler/queue-
+ * manager sub-blocks. Probe writes to all four are RAM-backed by the flat
+ * glue store (nothing in the driver reads them back), but two windows are
+ * overlaid with functional MMIO so the data path works with the guest's
+ * default use_dma=true: the queue-manager (submit push -> transfer ->
+ * completion pop) and the controller (channel teardown).
+ */
+
+/* Sub-window container offsets (SoC-abs = 0x47400000 + these). */
+#define CPPI_CTRL_OFFSET   0x2000
+#define CPPI_CTRL_SIZE     0x1000
+#define CPPI_QMGR_OFFSET   0x4000
+#define CPPI_QMGR_SIZE     0x4000
+
+/* Glue interrupt aggregator (musb_dsps.c:159-163). */
+#define USBSS_IRQ_STATUS   0x28
+#define USBSS_IRQ_ENABLER  0x2c
+#define USBSS_IRQ_CLEARR   0x30
+#define USBSS_IRQ_PD_COMP  (1u << 2)
+
+/* Controller window offsets, relative to CPPI_CTRL_OFFSET (cppi41.c:31-38). */
+#define CPPI_DMA_TXGCR(x)  (0x800 + (x) * 0x20)
+#define CPPI_DMA_RXGCR(x)  (0x808 + (x) * 0x20)
+#define CPPI_GCR_TEARDOWN  (1u << 30)
+
+/* Queue-manager window offsets, relative to CPPI_QMGR_OFFSET (cppi41.c:72-80).
+ * QUEUE_D(n) is push (submit, write) and pop (complete, read). */
+#define CPPI_QMGR_PEND(i)     (0x90 + (i) * 4)
+#define CPPI_QMGR_PEND_SLOTS  5           /* qmgr_num_pend (cppi41.c:1000) */
+#define CPPI_QMGR_QUEUE_BASE  0x2000
+#define CPPI_QMGR_QUEUE_D_OFF 0xc         /* QUEUE_D within a 0x10 stride */
+#define CPPI_QMGR_QUEUE_END   (0x2000 + AM335X_CPPI_NUM_QUEUES * 0x10)
+
+/* Host packet descriptor (cppi41.c:107-116, built at cppi41.c:513-570). */
+#define CPPI_DESC_BYTES       32          /* 8 x u32, 32-byte aligned      */
+#define CPPI_PD0_LEN_MASK     0x003fffffu /* pd_trans_len(): (1<<22)-1     */
+#define CPPI_PD_DESC_ALIGN     0x1fu      /* QUEUE_D low bits (cppi41.c:298) */
+#define CPPI_DESC_TYPE_TEARD  0x13        /* pd0 >> 27 for a teardown desc */
+
+/*
+ * USB1 submit-queue numbers (cppi41.c:155-225). The dmaengine port_num
+ * 15..29 == USB1 EP1..15; USB0 (port 0..14) submit queues stay inert.
+ *   TX submit: q = 62,64,..,90 (even)  -> EPn = (q-62)/2 + 1
+ *   RX submit: q = 16,17,..,30         -> EPn =  q-16  + 1
+ * Completion queues:  TX EPn -> 124+n,  RX EPn -> 140+n.
+ * Teardown queue (cppi41.c:998): submit=31, complete=0.
+ */
+#define CPPI_USB1_TX_SUBMIT_LO 62
+#define CPPI_USB1_TX_SUBMIT_HI 90
+#define CPPI_USB1_RX_SUBMIT_LO 16
+#define CPPI_USB1_RX_SUBMIT_HI 30
+#define CPPI_TD_SUBMIT_Q       31
+#define CPPI_TD_COMPLETE_Q     0
+
+static void am335x_cppi_update_irq(AM335xUsbssState *s);
 
 /* ======================================================================= */
 /* Flat "glue" byte-store helpers (USB0/ti-sysc/PHY/CPPI clean-probe).      */
@@ -286,6 +358,15 @@ static uint64_t am335x_usbss_glue_read(void *opaque, hwaddr offset,
         return USB_CONFIGDATA_VALUE;
     }
 
+    /* USBSS interrupt aggregator (musb_dsps.c): PD_COMP is the only bit the
+     * driver touches. Reading _ENABLER/_CLEARR returns the live enable. */
+    if (offset == USBSS_IRQ_STATUS) {
+        return s->cppi.irq_status;
+    }
+    if (offset == USBSS_IRQ_ENABLER || offset == USBSS_IRQ_CLEARR) {
+        return s->cppi.irq_enable;
+    }
+
     return am335x_usbss_load(s->regs, offset, size);
 }
 
@@ -297,6 +378,24 @@ static void am335x_usbss_glue_write(void *opaque, hwaddr offset,
     /* USB0 revision and CONFIGDATA are read-only. */
     if (offset == USB0_CTRL_BASE + CTRL_REVISION ||
         offset == USB0_MC_BASE + MC_INDEXED_BASE + IDX_FIFOSIZE) {
+        return;
+    }
+
+    /* USBSS interrupt aggregator: STATUS is write-1-to-clear, ENABLER sets
+     * and CLEARR clears the enable mask (musb_dsps.c:647-681). */
+    if (offset == USBSS_IRQ_STATUS) {
+        s->cppi.irq_status &= ~(uint32_t)value;
+        am335x_cppi_update_irq(s);
+        return;
+    }
+    if (offset == USBSS_IRQ_ENABLER) {
+        s->cppi.irq_enable |= (uint32_t)value;
+        am335x_cppi_update_irq(s);
+        return;
+    }
+    if (offset == USBSS_IRQ_CLEARR) {
+        s->cppi.irq_enable &= ~(uint32_t)value;
+        am335x_cppi_update_irq(s);
         return;
     }
 
@@ -430,12 +529,15 @@ enum {
     XFER_EP0_OUT,
     XFER_EP0_STATUS_IN,
     XFER_EP0_STATUS_OUT,
-    XFER_TX,            /* bulk/interrupt OUT on ep >= 1 */
-    XFER_RX,            /* bulk/interrupt IN  on ep >= 1 */
+    XFER_TX,            /* bulk/interrupt OUT on ep >= 1 (PIO)  */
+    XFER_RX,            /* bulk/interrupt IN  on ep >= 1 (PIO)  */
+    XFER_CPPI_TX,       /* bulk/interrupt OUT on ep >= 1 (CPPI) */
+    XFER_CPPI_RX,       /* bulk/interrupt IN  on ep >= 1 (CPPI) */
 };
 
 static void am335x_musb_issue(AM335xUsbssState *s, unsigned ep, bool is_rx);
 static void am335x_musb_arm(AM335xUsbssState *s);
+static void am335x_cppi_finish(AM335xUsbssState *s, unsigned ep, bool is_rx);
 
 /*
  * How long before the `is_rx` half of endpoint `ep` may be (re)issued.
@@ -496,11 +598,18 @@ static void am335x_musb_finish(AM335xUsbssState *s, unsigned ep, bool is_rx)
 
     if (status == USB_RET_NAK) {
         /* Device has nothing to give/take yet: re-poll at the endpoint's
-         * pace (interrupt interval / generic NAK cadence). Stays active. */
+         * pace (interrupt interval / generic NAK cadence). Stays active.
+         * A CPPI transfer re-polls the same way -- on real silicon the
+         * STARV_RETRY/AUTOREQ hardware keeps retrying until data moves. */
         usb_packet_cleanup(p);
         h->next_poll = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                        am335x_musb_poll_ns(s, ep, is_rx);
         am335x_musb_arm(s);
+        return;
+    }
+
+    if (h->cppi) {
+        am335x_cppi_finish(s, ep, is_rx);
         return;
     }
 
@@ -602,6 +711,24 @@ static void am335x_musb_issue(AM335xUsbssState *s, unsigned ep, bool is_rx)
         buf = e->tx.fifo;
         len = e->tx.fifo_len;
         break;
+    case XFER_CPPI_TX:
+        /* CPPI bulk/interrupt OUT: same endpoint routing as PIO XFER_TX,
+         * but the data was DMA'd from the guest buffer into cppi_buf. */
+        pid = USB_TOKEN_OUT;
+        devaddr = e->busctl[MUSB_TXFUNCADDR];
+        target_ep = e->txtype & MUSB_TYPE_REMOTE_END;
+        buf = h->cppi_buf;
+        len = h->cppi_req_len;
+        break;
+    case XFER_CPPI_RX:
+        /* CPPI bulk/interrupt IN: routing as PIO XFER_RX; received data
+         * lands in cppi_buf and is DMA'd to the guest buffer on finish. */
+        pid = USB_TOKEN_IN;
+        devaddr = e->busctl[MUSB_RXFUNCADDR];
+        target_ep = e->rxtype & MUSB_TYPE_REMOTE_END;
+        buf = h->cppi_buf;
+        len = h->cppi_req_len;
+        break;
     case XFER_RX:
     default:
         pid = USB_TOKEN_IN;
@@ -677,18 +804,40 @@ static void am335x_musb_tx_poke(AM335xUsbssState *s, unsigned ep)
     if (e->tx.active) {
         return;
     }
+    /* When DMA is armed the transfer is driven by the CPPI submit-queue
+     * push, not the FIFO; the driver never sets TXPKTRDY in that case, but
+     * guard explicitly so a stray write cannot start a parallel PIO OUT. */
+    if (e->txcsr & MUSB_TXCSR_DMAENAB) {
+        return;
+    }
     if (e->txcsr & MUSB_TXCSR_TXPKTRDY) {
         e->tx.kind = XFER_TX;
         am335x_musb_issue(s, ep, false);
     }
 }
 
-/* RXCSR.H_REQPKT write -> request a bulk/interrupt IN packet on EP `ep`. */
+/*
+ * RXCSR.H_REQPKT write -> request a bulk/interrupt IN packet on EP `ep`.
+ *
+ * When CPPI DMA is active (the guest created the dma_controller, so PD_COMP
+ * is enabled -- i.e. the default use_dma=true), every IN transfer on EP1-15
+ * is driven by a CPPI submit-queue push, never PIO: musb_ep_program() always
+ * allocates a DMA channel for epnum>0. Worse, on each DMA completion
+ * musb_host_rx() rewrites RXCSR twice -- first clearing H_REQPKT
+ * (musb_host.c:1869-1873), then re-setting it while clearing DMAENAB
+ * (musb_host.c:1879-1883) -- a genuine 0->1 edge that must NOT launch a stray
+ * PIO IN token (it would steal a packet from the DMA endpoint and desync the
+ * class driver). So suppress PIO IN on EP1-15 entirely while CPPI is active;
+ * the well-exercised use_dma=0 PIO path (PD_COMP disabled) is unchanged.
+ */
 static void am335x_musb_rx_poke(AM335xUsbssState *s, unsigned ep)
 {
     AM335xMusbEp *e = &s->musb.ep[ep];
 
     if (e->rx.active) {
+        return;
+    }
+    if (ep >= 1 && (s->cppi.irq_enable & USBSS_IRQ_PD_COMP)) {
         return;
     }
     if (e->rxcsr & MUSB_RXCSR_H_REQPKT) {
@@ -1105,6 +1254,292 @@ static const MemoryRegionOps am335x_musb_mc_ops = {
 };
 
 /* ======================================================================= */
+/* CPPI4.1 DMA: queue-manager submit -> transfer -> completion data path.  */
+/*
+ * With the guest's default use_dma=true, musb routes every bulk/interrupt
+ * transfer on EP1-15 through CPPI (musb_host.c:670-894 bypasses the PIO
+ * FIFO). The provider driver builds an 8-word host descriptor in guest DMA
+ * memory and pushes its physical address onto the endpoint's submit queue
+ * (QMGR_QUEUE_D write). This model decodes that descriptor, moves the buffer
+ * through the USB1 endpoint using the same usb_handle_packet() plumbing as
+ * the PIO engine, writes the transferred length back into the descriptor,
+ * and posts it onto the endpoint's completion queue -- setting the queue's
+ * QMGR_PEND bit and raising USBSS_IRQ_STATUS.PD_COMP (INTC 17) so the
+ * guest's cppi41_irq()/cppi41_pop_desc() drain it.
+ */
+
+/* Level-drive the CPPI "glue" completion line (INTC 17). */
+static void am335x_cppi_update_irq(AM335xUsbssState *s)
+{
+    bool pending = (s->cppi.irq_status & s->cppi.irq_enable &
+                    USBSS_IRQ_PD_COMP) != 0;
+
+    qemu_set_irq(s->irq[2], pending);
+}
+
+/* Push a descriptor phys onto completion queue `q`'s ring. */
+static void am335x_cppi_cq_push(AM335xUsbssState *s, unsigned q, uint32_t desc)
+{
+    AM335xCppiCq *cq;
+
+    if (q >= AM335X_CPPI_NUM_QUEUES) {
+        return;
+    }
+    cq = &s->cppi.cq[q];
+    if (cq->count >= AM335X_CPPI_CQ_DEPTH) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "am335x-usbss: CPPI completion queue %u overflow\n", q);
+        return;
+    }
+    cq->desc[cq->tail] = desc;
+    cq->tail = (cq->tail + 1) % AM335X_CPPI_CQ_DEPTH;
+    cq->count++;
+}
+
+/* Post a completed transfer descriptor and raise the PD_COMP interrupt. */
+/*
+ * Bottom half: post every pending completed descriptor onto its completion
+ * queue and raise PD_COMP once. Runs in the main loop, so the IRQ is asserted
+ * outside any guest cppi41_irq context (see the AM335xCppi.comp[] rationale).
+ */
+static void am335x_cppi_comp_bh(void *opaque)
+{
+    AM335xUsbssState *s = AM335X_USBSS(opaque);
+    AM335xCppi *c = &s->cppi;
+    bool posted = false;
+
+    while (c->comp_count) {
+        AM335xCppiComp *e = &c->comp[c->comp_head];
+
+        am335x_cppi_cq_push(s, e->q, e->desc);
+        c->comp_head = (c->comp_head + 1) % AM335X_CPPI_COMP_RING;
+        c->comp_count--;
+        posted = true;
+    }
+    if (posted) {
+        c->irq_status |= USBSS_IRQ_PD_COMP;
+        am335x_cppi_update_irq(s);
+    }
+}
+
+/* Queue a finished descriptor for deferred completion posting (see above). */
+static void am335x_cppi_defer_completion(AM335xUsbssState *s, unsigned q,
+                                         uint32_t desc)
+{
+    AM335xCppi *c = &s->cppi;
+
+    if (c->comp_count >= AM335X_CPPI_COMP_RING) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "am335x-usbss: CPPI completion ring overflow\n");
+        return;
+    }
+    c->comp[c->comp_tail].q = q;
+    c->comp[c->comp_tail].desc = desc;
+    c->comp_tail = (c->comp_tail + 1) % AM335X_CPPI_COMP_RING;
+    c->comp_count++;
+    qemu_bh_schedule(s->cppi_comp_bh);
+}
+
+/*
+ * Turn a finished CPPI transfer into descriptor write-back + completion-queue
+ * post (happy path), or -- for a protocol stall/error -- into a musb endpoint
+ * interrupt (INTC 19) so musb_host_{tx,rx}() aborts the channel, exactly as
+ * the core would on real silicon.
+ */
+static void am335x_cppi_finish(AM335xUsbssState *s, unsigned ep, bool is_rx)
+{
+    AM335xMusbEp *e = &s->musb.ep[ep];
+    AM335xMusbHalf *h = is_rx ? &e->rx : &e->tx;
+    USBPacket *p = &h->packet;
+    int status = p->status;
+    uint32_t actual = (status >= 0) ? p->actual_length : 0;
+    uint32_t pd0;
+    uint8_t w[4];
+
+    if (status == USB_RET_STALL || status < 0) {
+        if (is_rx) {
+            e->rxcsr |= (status == USB_RET_STALL) ? MUSB_RXCSR_H_RXSTALL
+                                                  : MUSB_RXCSR_H_ERROR;
+            am335x_musb_raise_rx(s, ep);
+        } else {
+            e->txcsr |= (status == USB_RET_STALL) ? MUSB_TXCSR_H_RXSTALL
+                                                  : MUSB_TXCSR_H_ERROR;
+            am335x_musb_raise_tx(s, ep);
+        }
+        h->cppi = false;
+        h->active = false;
+        usb_packet_cleanup(p);
+        return;
+    }
+
+    /* IN: deliver the received bytes to the guest DMA buffer. */
+    if (is_rx && actual) {
+        dma_memory_write(&address_space_memory, h->cppi_buf_phys,
+                         h->cppi_buf, actual, MEMTXATTRS_UNSPECIFIED);
+    }
+
+    /*
+     * Write the actual transferred length into pd0 (keeping the descriptor
+     * type). cppi41_irq() reads len = pd_trans_len(pd0) and residue =
+     * pd_trans_len(pd6) - len (cppi41.c:349-354); pd6 still holds the
+     * requested length, so residue = requested - actual as the driver
+     * expects for short-packet detection.
+     */
+    pd0 = (h->cppi_pd0 & ~CPPI_PD0_LEN_MASK) | (actual & CPPI_PD0_LEN_MASK);
+    stl_le_p(w, pd0);
+    dma_memory_write(&address_space_memory, h->cppi_desc_phys, w, sizeof(w),
+                     MEMTXATTRS_UNSPECIFIED);
+
+    am335x_cppi_defer_completion(s, h->cppi_qcomp, h->cppi_desc_phys);
+
+    h->cppi = false;
+    h->active = false;
+    usb_packet_cleanup(p);
+}
+
+/*
+ * Decode the host descriptor at `desc_phys` and start the transfer on USB1
+ * endpoint `ep` (direction from the submit queue). Reuses am335x_musb_issue()
+ * -- the transfer completes synchronously, asynchronously (port .complete),
+ * or NAK-repolls, all handled by am335x_musb_finish() -> am335x_cppi_finish.
+ */
+static void am335x_cppi_start(AM335xUsbssState *s, unsigned ep, bool is_rx,
+                              uint32_t desc_phys)
+{
+    AM335xMusbHalf *h = is_rx ? &s->musb.ep[ep].rx : &s->musb.ep[ep].tx;
+    uint8_t raw[CPPI_DESC_BYTES];
+    uint32_t pd0, pd4, req_len;
+
+    if (ep == 0 || ep >= AM335X_MUSB_NUM_EP) {
+        return;
+    }
+    if (h->active) {
+        /* The driver serialises one descriptor per channel; a push while a
+         * transfer is still in flight would corrupt state, so drop it. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "am335x-usbss: CPPI submit while EP%u %s busy\n",
+                      ep, is_rx ? "RX" : "TX");
+        return;
+    }
+
+    dma_memory_read(&address_space_memory, desc_phys, raw, sizeof(raw),
+                    MEMTXATTRS_UNSPECIFIED);
+    pd0 = ldl_le_p(raw + 0);
+    pd4 = ldl_le_p(raw + 16);
+    req_len = pd0 & CPPI_PD0_LEN_MASK;
+
+    h->cppi = true;
+    h->kind = is_rx ? XFER_CPPI_RX : XFER_CPPI_TX;
+    h->cppi_desc_phys = desc_phys;
+    h->cppi_buf_phys = pd4;
+    h->cppi_pd0 = pd0;
+    h->cppi_req_len = req_len;
+    h->cppi_qcomp = is_rx ? (140 + ep) : (124 + ep);
+
+    if (h->cppi_buf_cap < req_len) {
+        h->cppi_buf = g_realloc(h->cppi_buf, req_len);
+        h->cppi_buf_cap = req_len;
+    }
+    /* OUT: gather the data to send from the guest DMA buffer now. */
+    if (!is_rx && req_len) {
+        dma_memory_read(&address_space_memory, pd4, h->cppi_buf, req_len,
+                        MEMTXATTRS_UNSPECIFIED);
+    }
+
+    am335x_musb_issue(s, ep, is_rx);
+}
+
+/* QMGR_QUEUE_D(n) write == a descriptor push onto submit queue `n`. */
+static void am335x_cppi_submit(AM335xUsbssState *s, unsigned q, uint32_t val)
+{
+    uint32_t desc_phys = val & ~CPPI_PD_DESC_ALIGN;
+    unsigned ep;
+
+    if (q == CPPI_TD_SUBMIT_Q) {
+        /* Teardown descriptor: remember it for the channel_abort handler. */
+        s->cppi.td_desc_phys = desc_phys;
+        return;
+    }
+    if (q >= CPPI_USB1_TX_SUBMIT_LO && q <= CPPI_USB1_TX_SUBMIT_HI &&
+        !((q - CPPI_USB1_TX_SUBMIT_LO) & 1)) {
+        ep = (q - CPPI_USB1_TX_SUBMIT_LO) / 2 + 1;
+        am335x_cppi_start(s, ep, false, desc_phys);
+    } else if (q >= CPPI_USB1_RX_SUBMIT_LO && q <= CPPI_USB1_RX_SUBMIT_HI) {
+        ep = q - CPPI_USB1_RX_SUBMIT_LO + 1;
+        am335x_cppi_start(s, ep, true, desc_phys);
+    }
+    /* USB0 (inert host) and unused submit slots: ignore. */
+}
+
+/* ----- CPPI queue-manager window MMIO (abs 0x47404000, 16KB) ----------- */
+
+static uint64_t am335x_cppi_qmgr_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    AM335xUsbssState *s = AM335X_USBSS(opaque);
+
+    /* QMGR_PEND(i): completion-queue pending bitmap (cppi41.c:315). */
+    if (offset >= CPPI_QMGR_PEND(0) &&
+        offset < CPPI_QMGR_PEND(CPPI_QMGR_PEND_SLOTS) &&
+        ((offset - CPPI_QMGR_PEND(0)) & 3) == 0 && size == 4) {
+        unsigned slot = (offset - CPPI_QMGR_PEND(0)) / 4;
+        uint32_t v = 0;
+
+        for (unsigned b = 0; b < 32; b++) {
+            unsigned q = slot * 32 + b;
+            if (q < AM335X_CPPI_NUM_QUEUES && s->cppi.cq[q].count) {
+                v |= 1u << b;
+            }
+        }
+        return v;
+    }
+
+    /* QMGR_QUEUE_D(n) read: pop a descriptor from completion queue n. */
+    if (offset >= CPPI_QMGR_QUEUE_BASE && offset < CPPI_QMGR_QUEUE_END &&
+        (offset & 0xf) == CPPI_QMGR_QUEUE_D_OFF && size == 4) {
+        unsigned q = (offset - CPPI_QMGR_QUEUE_BASE) / 0x10;
+        AM335xCppiCq *cq = &s->cppi.cq[q];
+
+        if (cq->count) {
+            uint32_t d = cq->desc[cq->head];
+
+            cq->head = (cq->head + 1) % AM335X_CPPI_CQ_DEPTH;
+            cq->count--;
+            return d;
+        }
+        return 0;
+    }
+
+    /* Probe-time LRAM/MEMBASE/MEMCTRL/QUEUE_{A,B,C}: flat glue store. */
+    return am335x_usbss_load(s->regs, CPPI_QMGR_OFFSET + offset, size);
+}
+
+static void am335x_cppi_qmgr_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+    AM335xUsbssState *s = AM335X_USBSS(opaque);
+
+    /* QMGR_QUEUE_D(n) write: descriptor push onto submit queue n. */
+    if (offset >= CPPI_QMGR_QUEUE_BASE && offset < CPPI_QMGR_QUEUE_END &&
+        (offset & 0xf) == CPPI_QMGR_QUEUE_D_OFF && size == 4) {
+        unsigned q = (offset - CPPI_QMGR_QUEUE_BASE) / 0x10;
+
+        am335x_cppi_submit(s, q, (uint32_t)value);
+        return;
+    }
+
+    am335x_usbss_store(s->regs, CPPI_QMGR_OFFSET + offset, value, size);
+}
+
+static const MemoryRegionOps am335x_cppi_qmgr_ops = {
+    .read = am335x_cppi_qmgr_read,
+    .write = am335x_cppi_qmgr_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* ======================================================================= */
 /* USB1 musb host: USBBus / USBPort.                                       */
 
 /* Arm the shared poll timer for the earliest pending half's deadline. */
@@ -1280,6 +1715,9 @@ static void am335x_musb_reset(AM335xUsbssState *s)
     if (m->nak_timer) {
         timer_del(m->nak_timer);
     }
+    if (s->cppi_comp_bh) {
+        qemu_bh_cancel(s->cppi_comp_bh);
+    }
 
     for (unsigned i = 0; i < AM335X_MUSB_NUM_EP; i++) {
         AM335xMusbEp *e = &m->ep[i];
@@ -1297,6 +1735,10 @@ static void am335x_musb_reset(AM335xUsbssState *s)
                 usb_packet_cleanup(&h->packet);
             }
             h->active = false;
+            h->cppi = false;
+            g_free(h->cppi_buf);
+            h->cppi_buf = NULL;
+            h->cppi_buf_cap = 0;
         }
     }
 
@@ -1315,8 +1757,12 @@ static void am335x_usbss_reset(DeviceState *dev)
 
     am335x_musb_reset(s);
 
+    /* CPPI4.1 queue-manager completion state. */
+    memset(&s->cppi, 0, sizeof(s->cppi));
+
     qemu_set_irq(s->irq[0], 0);
     qemu_set_irq(s->irq[1], 0);
+    qemu_set_irq(s->irq[2], 0);
 }
 
 static void am335x_usbss_realize(DeviceState *dev, Error **errp)
@@ -1344,11 +1790,22 @@ static void am335x_usbss_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->container, AM335X_USB1_MC_OFFSET,
                                         &s->musb_mc, 1);
 
+    /* CPPI4.1 queue-manager window: functional submit/completion data path
+     * (the controller/scheduler/glue windows stay flat-store clean-probe). */
+    memory_region_init_io(&s->cppi_qmgr, OBJECT(s), &am335x_cppi_qmgr_ops, s,
+                          "am335x-usbss-cppi-qmgr", CPPI_QMGR_SIZE);
+    memory_region_add_subregion_overlap(&s->container, CPPI_QMGR_OFFSET,
+                                        &s->cppi_qmgr, 1);
+
     sysbus_init_mmio(sbd, &s->container);
 
-    /* Per-instance musb "mc" interrupt outputs -> INTC 18 (USB0)/19 (USB1). */
+    /*
+     * Interrupt outputs: musb "mc" lines -> INTC 18 (USB0)/19 (USB1), and the
+     * CPPI4.1 DMA completion "glue" line -> INTC 17 (irq[2]).
+     */
     sysbus_init_irq(sbd, &s->irq[0]);
     sysbus_init_irq(sbd, &s->irq[1]);
+    sysbus_init_irq(sbd, &s->irq[2]);
 
     /* USB1 host bus + type-A root port (full/low/high speed). */
     usb_bus_new(&m->bus, sizeof(m->bus), &am335x_musb_bus_ops, dev);
@@ -1357,6 +1814,7 @@ static void am335x_usbss_realize(DeviceState *dev, Error **errp)
                       USB_SPEED_MASK_HIGH);
 
     m->nak_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, am335x_musb_nak_timer, s);
+    s->cppi_comp_bh = qemu_bh_new(am335x_cppi_comp_bh, s);
 }
 
 static void am335x_usbss_unrealize(DeviceState *dev)
@@ -1366,6 +1824,18 @@ static void am335x_usbss_unrealize(DeviceState *dev)
     if (s->musb.nak_timer) {
         timer_free(s->musb.nak_timer);
         s->musb.nak_timer = NULL;
+    }
+    if (s->cppi_comp_bh) {
+        qemu_bh_delete(s->cppi_comp_bh);
+        s->cppi_comp_bh = NULL;
+    }
+    for (unsigned i = 0; i < AM335X_MUSB_NUM_EP; i++) {
+        AM335xMusbEp *e = &s->musb.ep[i];
+
+        g_free(e->tx.cppi_buf);
+        e->tx.cppi_buf = NULL;
+        g_free(e->rx.cppi_buf);
+        e->rx.cppi_buf = NULL;
     }
 }
 

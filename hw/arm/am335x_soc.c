@@ -83,6 +83,7 @@
 #define AM335X_USBSS_BASE       0x47400000
 #define AM335X_IRQ_USB0         18
 #define AM335X_IRQ_USB1         19
+#define AM335X_IRQ_USBSS        17   /* CPPI4.1 DMA completion ("glue") */
 
 /*
  * EDMA3 (TRM spruh73q ch.11). TPCC (Third-Party Channel Controller, the
@@ -431,17 +432,14 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_MISC));
 
     /*
-     * USB Subsystem (USBSS) @ 0x47400000, a "clean probe" register-file
-     * stub covering the whole 32KB target-module window (USB0/USB1
-     * control+mc blocks and the CPPI4.1 DMA glue/queue-manager range).
-     * Its sole functional job is to let musb-hdrc/musb_dsps probe
-     * without the -ENODEV that a fully-unmapped window causes (real
-     * silicon's USBnREV wrapper-revision register reads back non-zero;
-     * unassigned memory does not) and register a host/gadget instance.
-     * The two per-instance musb "mc" interrupt outputs are wired to INTC
-     * 18 (USB0) and 19 (USB1); USB0's line stays idle (clean-probe stub)
-     * while USB1's is driven by the functional host model. CPPI4.1 DMA is
-     * not modelled -- see hw/misc/am335x_usbss.c.
+     * USB Subsystem (USBSS) @ 0x47400000, covering the whole 32KB target-
+     * module window (USB0/USB1 control+mc blocks and the CPPI4.1 DMA range).
+     * USB1 is a functional musb host: it enumerates devices and moves
+     * bulk/interrupt data over PIO and over a functional CPPI4.1 DMA path
+     * (the guest's default use_dma=true). USB0 stays a clean-probe stub.
+     * Three interrupt outputs: the per-instance musb "mc" lines to INTC 18
+     * (USB0, idle) and 19 (USB1), and the CPPI4.1 DMA completion ("glue")
+     * line to INTC 17. See hw/misc/am335x_usbss.c.
      */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->usbss), errp)) {
         return;
@@ -451,6 +449,8 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(dev, AM335X_IRQ_USB0));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->usbss), 1,
                        qdev_get_gpio_in(dev, AM335X_IRQ_USB1));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->usbss), 2,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_USBSS));
 
     /*
      * EDMA3 channel controller (TPCC) @ 0x49000000. A real device so the
