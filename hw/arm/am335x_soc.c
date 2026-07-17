@@ -106,6 +106,16 @@
 #define AM335X_IRQ_MCASP0_TX    80
 #define AM335X_IRQ_MCASP0_RX    81
 
+/*
+ * McSPI0 (TRM spruh73q ch.24, base 0x48030000, Table 2-3), a "clean probe"
+ * ti-sysc + register-file stub (see hw/ssi/am335x_mcspi.c) that only exists
+ * to satisfy ti-sysc's OCP softreset handshake -- nothing in this project
+ * boots from SPI or attaches a device to McSPI0/1's expansion-header pins.
+ * INTC line 65 = McSPI0INT (TRM Table 6-1; DT spi0 interrupts <65>), wired
+ * but never asserted since this stub runs no transfers. */
+#define AM335X_MCSPI0_BASE      0x48030000
+#define AM335X_IRQ_MCSPI0       65
+
 /* DMTIMER0..3 MMIO bases and INTC input lines (TRM spruh73q ch.6/20).
  * one_ms marks the "ti,am335x-timer-1ms" variant (DMTIMER1), whose OCP
  * SYSCONFIG has SOFTRESET at bit 1 (bit 0 is AUTOIDLE); the regular timers
@@ -202,6 +212,7 @@ static void am335x_soc_init(Object *obj)
     object_initialize_child(obj, "usbss", &s->usbss, TYPE_AM335X_USBSS);
     object_initialize_child(obj, "edma", &s->edma, TYPE_AM335X_EDMA);
     object_initialize_child(obj, "mcasp0", &s->mcasp0, TYPE_AM335X_MCASP);
+    object_initialize_child(obj, "mcspi0", &s->mcspi0, TYPE_AM335X_MCSPI);
     object_initialize_child(obj, "uart0", &s->uart0, TYPE_AM335X_UART);
 }
 
@@ -481,6 +492,24 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(dev, AM335X_IRQ_MCASP0_TX));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->mcasp0), 1,
                        qdev_get_gpio_in(dev, AM335X_IRQ_MCASP0_RX));
+
+    /*
+     * McSPI0 @ 0x48030000, IRQ 65. A "clean probe" register-file stub (see
+     * hw/ssi/am335x_mcspi.c) whose sole job is to let the generic ti-sysc
+     * bus wrapper's OCP softreset handshake complete -- against unmapped
+     * memory it never does, which is the source of the recurring
+     * "ti-sysc 48030000.target-module: Reset failed with -110" / "probe
+     * with driver ti-sysc failed with error -110" boot noise -- and then
+     * to let omap2_mcspi_probe() register an (empty) SPI controller. No
+     * transfer engine or attached SPI device: nothing in this project
+     * boots from SPI or wires up McSPI0/1's expansion-header pins.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mcspi0), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mcspi0), 0, AM335X_MCSPI0_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->mcspi0), 0,
+                       qdev_get_gpio_in(dev, AM335X_IRQ_MCSPI0));
 
     /*
      * Placeholders for peripherals that become real devices in later

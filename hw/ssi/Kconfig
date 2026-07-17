@@ -32,3 +32,9 @@ config PNV_SPI
 config ALLWINNER_A10_SPI
     bool
     select SSI
+
+config AM335X_MCSPI
+    bool
+    # No "select SSI": this is a ti-sysc/register-level "clean probe"
+    # stub (see am335x_mcspi.c) with no SSIBus/attached SPI device --
+    # the mainline ti,omap4-mcspi driver's probe() never requires one.
