@@ -98,6 +98,16 @@ typedef struct AM335xMusbHalf {
      * endpoint's CPPI completion queue + raises the USBSS PD_COMP interrupt.
      */
     bool      cppi;             /* in-flight transfer is CPPI-driven        */
+    /*
+     * RX only: set once DMAENAB (or a CPPI submit) has armed DMA for the
+     * current transfer setup, cleared by the next FIFO flush / data-toggle
+     * clear (musb_rx_reinit, i.e. a fresh transfer). Lets rx_poke tell a
+     * genuine PIO IN request (H_REQPKT with no DMA ever armed -- the driver's
+     * dma_channel==NULL fallback, which must be serviced) apart from the
+     * stray H_REQPKT musb_host_rx leaves set after a *completed* CPPI IN
+     * (which must be ignored, else it steals a packet from the DMA endpoint).
+     */
+    bool      dma_epoch;
     uint32_t  cppi_desc_phys;   /* descriptor guest phys (for write-back)   */
     uint32_t  cppi_buf_phys;    /* data buffer guest phys (pd4)             */
     uint32_t  cppi_pd0;         /* descriptor pd0 (type|len) as submitted   */

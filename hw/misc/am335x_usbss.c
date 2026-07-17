@@ -205,8 +205,10 @@
 #define MUSB_TXCSR_TXPKTRDY    0x0001
 
 #define MUSB_RXCSR_DMAENAB     0x2000
+#define MUSB_RXCSR_CLRDATATOG  0x0080
 #define MUSB_RXCSR_H_RXSTALL   0x0040
 #define MUSB_RXCSR_H_REQPKT    0x0020
+#define MUSB_RXCSR_FLUSHFIFO   0x0010
 #define MUSB_RXCSR_DATAERROR   0x0008
 #define MUSB_RXCSR_H_ERROR     0x0004
 #define MUSB_RXCSR_FIFOFULL    0x0002
@@ -820,15 +822,22 @@ static void am335x_musb_tx_poke(AM335xUsbssState *s, unsigned ep)
  * RXCSR.H_REQPKT write -> request a bulk/interrupt IN packet on EP `ep`.
  *
  * When CPPI DMA is active (the guest created the dma_controller, so PD_COMP
- * is enabled -- i.e. the default use_dma=true), every IN transfer on EP1-15
- * is driven by a CPPI submit-queue push, never PIO: musb_ep_program() always
- * allocates a DMA channel for epnum>0. Worse, on each DMA completion
- * musb_host_rx() rewrites RXCSR twice -- first clearing H_REQPKT
- * (musb_host.c:1869-1873), then re-setting it while clearing DMAENAB
- * (musb_host.c:1879-1883) -- a genuine 0->1 edge that must NOT launch a stray
- * PIO IN token (it would steal a packet from the DMA endpoint and desync the
- * class driver). So suppress PIO IN on EP1-15 entirely while CPPI is active;
- * the well-exercised use_dma=0 PIO path (PD_COMP disabled) is unchanged.
+ * is enabled -- i.e. the default use_dma=true), a bulk/interrupt IN on EP1-15
+ * is normally driven by a CPPI submit-queue push, not PIO. Two H_REQPKT cases
+ * must NOT launch a PIO IN token:
+ *   - DMAENAB is set in the same setup: the transfer is CPPI-driven (the
+ *     submit-queue push moves the data); H_REQPKT is just the arm bit.
+ *   - a stray H_REQPKT musb_host_rx() leaves set *after* a completed CPPI IN
+ *     (it clears DMAENAB but keeps H_REQPKT -- musb_host.c:1879-1883); a PIO
+ *     token here would steal a packet from the DMA endpoint and desync the
+ *     class driver. This is the "dma_epoch" case (DMA was armed for this
+ *     transfer).
+ * But musb_ep_program() falls back to a genuine PIO IN whenever it cannot get
+ * a DMA channel (channel_alloc()==NULL, musb_host.c:705-716): H_REQPKT with no
+ * DMAENAB and no DMA ever armed for this setup (dma_epoch clear). That request
+ * is real and must be serviced over PIO -- suppressing it (as a blanket EP>=1
+ * suppression once did) hangs the transfer until the 30s SCSI timeout. The
+ * use_dma=0 PIO path (PD_COMP disabled) is likewise unaffected.
  */
 static void am335x_musb_rx_poke(AM335xUsbssState *s, unsigned ep)
 {
@@ -838,7 +847,25 @@ static void am335x_musb_rx_poke(AM335xUsbssState *s, unsigned ep)
         return;
     }
     if (ep >= 1 && (s->cppi.irq_enable & USBSS_IRQ_PD_COMP)) {
-        return;
+        if (e->rxcsr & MUSB_RXCSR_DMAENAB) {
+            return;             /* CPPI-driven: data moves via the submit push */
+        }
+        if (e->rx.dma_epoch) {
+            /*
+             * Stray H_REQPKT left set after a completed CPPI IN (musb_host_rx
+             * writes it back while only meaning to clear DMAENAB,
+             * musb_host.c:1879-1883). The DMA path already moved the data, so
+             * there is nothing to fetch: don't issue a PIO token, and scrub
+             * H_REQPKT from the register so a later rx_reinit==0
+             * musb_ep_program() doesn't read it back as an inconsistent
+             * endpoint state ("broken !rx_reinit, ep.. csr 0620"). On real
+             * silicon the request resolves against the already-drained
+             * endpoint rather than latching a spurious pending IN.
+             */
+            e->rxcsr &= ~MUSB_RXCSR_H_REQPKT;
+            return;
+        }
+        /* else: genuine PIO IN fallback (no DMA channel) -- service it. */
     }
     if (e->rxcsr & MUSB_RXCSR_H_REQPKT) {
         e->rx.kind = XFER_RX;
@@ -1032,8 +1059,23 @@ static void am335x_musb_indexed_write(AM335xUsbssState *s, hwaddr ioff,
         break;
     case IDX_RXCSR: {
         uint16_t wzc = MUSB_RXCSR_H_WZC_BITS;
-        ep->rxcsr = ((uint16_t)value & ~wzc) |
-                    (ep->rxcsr & (uint16_t)value & wzc);
+        uint16_t written = (uint16_t)value;
+
+        ep->rxcsr = (written & ~wzc) | (ep->rxcsr & written & wzc);
+        /*
+         * Track whether DMA has been armed for the current RX transfer setup
+         * (see AM335xMusbHalf.dma_epoch). A DMAENAB write arms it; a FIFO
+         * flush / data-toggle clear (musb_rx_reinit, i.e. a fresh transfer)
+         * resets it so the next H_REQPKT is judged on its own merits.
+         */
+        if (m->index >= 1) {
+            if (written & MUSB_RXCSR_DMAENAB) {
+                ep->rx.dma_epoch = true;
+            } else if (written &
+                       (MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_CLRDATATOG)) {
+                ep->rx.dma_epoch = false;
+            }
+        }
         am335x_musb_rx_poke(s, m->index);
         break;
     }
@@ -1453,6 +1495,9 @@ static void am335x_cppi_start(AM335xUsbssState *s, unsigned ep, bool is_rx,
     req_len = pd0 & CPPI_PD0_LEN_MASK;
 
     h->cppi = true;
+    if (is_rx) {
+        h->dma_epoch = true;    /* a CPPI IN transfer is under way on this half */
+    }
     h->kind = is_rx ? XFER_CPPI_RX : XFER_CPPI_TX;
     h->cppi_desc_phys = desc_phys;
     h->cppi_buf_phys = pd4;
@@ -1849,6 +1894,7 @@ static void am335x_musb_reset(AM335xUsbssState *s)
             }
             h->active = false;
             h->cppi = false;
+            h->dma_epoch = false;
             g_free(h->cppi_buf);
             h->cppi_buf = NULL;
             h->cppi_buf_cap = 0;
