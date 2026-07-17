@@ -114,6 +114,7 @@
 #include "qemu/osdep.h"
 #include "hw/misc/am335x_usbss.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
 #include "qemu/bitops.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
@@ -282,6 +283,9 @@ static void am335x_usbss_reset(DeviceState *dev)
     stl_le_p(s->regs + USB1_CTRL_BASE + CTRL_PHY_UTMI, USB_PHY_UTMI_RESET);
     stl_le_p(s->regs + USB0_CTRL_BASE + CTRL_MODE, USB_MODE_RESET);
     stl_le_p(s->regs + USB1_CTRL_BASE + CTRL_MODE, USB_MODE_RESET);
+
+    qemu_set_irq(s->irq[0], 0);
+    qemu_set_irq(s->irq[1], 0);
 }
 
 static void am335x_usbss_realize(DeviceState *dev, Error **errp)
@@ -294,6 +298,10 @@ static void am335x_usbss_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &am335x_usbss_ops, s,
                           TYPE_AM335X_USBSS, AM335X_USBSS_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+
+    /* Per-instance musb "mc" interrupt outputs -> INTC 18 (USB0)/19 (USB1). */
+    sysbus_init_irq(sbd, &s->irq[0]);
+    sysbus_init_irq(sbd, &s->irq[1]);
 }
 
 static void am335x_usbss_class_init(ObjectClass *klass, void *data)

@@ -49,6 +49,16 @@ struct AM335xUsbssState {
     MemoryRegion iomem;
 
     /*
+     * Per-instance "mc" (musb core) interrupt outputs, wired to INTC
+     * inputs 18 (USB0) and 19 (USB1) -- the DT `interrupts` property on
+     * usb0@1400 / usb1@1800 (am33xx.dtsi). request_irq() in
+     * musb_init_controller() needs the line to resolve; a functional host
+     * model asserts irq[1] (USB1) from the musb core interrupt registers.
+     * irq[0] (USB0) stays idle -- USB0 is left as a clean-probe stub.
+     */
+    qemu_irq irq[2];
+
+    /*
      * Flat, byte-addressable backing store for the whole window,
      * allocated at realize. musb-hdrc/musb_dsps mixes 8/16/32-bit
      * accesses within the same register block (FADDR/POWER are 8-bit,
