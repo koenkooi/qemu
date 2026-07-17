@@ -69,7 +69,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(AM335xUsbssState, AM335X_USBSS)
  */
 #define AM335X_MUSB_FIFO_SIZE 4096
 
-/* Per-endpoint musb-core register + FIFO state (host mode). */
+/*
+ * One direction (TX or RX) of a hardware endpoint. musb endpoints are
+ * bidirectional: the TX and RX halves of the same hardware endpoint can be
+ * assigned to two different device endpoints and carry transfers at the
+ * same time (e.g. a hub's interrupt IN on the RX half while a mass-storage
+ * bulk OUT uses the TX half). Each half therefore owns an independent
+ * in-flight transfer and its own PIO FIFO (writes to the FIFO port land in
+ * the TX FIFO, reads drain the RX FIFO).
+ */
+typedef struct AM335xMusbHalf {
+    USBPacket packet;
+    bool      active;       /* async-inflight or awaiting a (re)poll        */
+    uint8_t   kind;         /* AM335xMusbXfer phase/direction (in .c)       */
+    int64_t   next_poll;    /* earliest QEMU_CLOCK_VIRTUAL time to (re)issue */
+    uint8_t   fifo[AM335X_MUSB_FIFO_SIZE];
+    uint32_t  fifo_len;     /* valid bytes                                  */
+    uint32_t  fifo_rd;      /* drain cursor                                 */
+} AM335xMusbHalf;
+
+/* Per-endpoint musb-core register state (host mode). */
 typedef struct AM335xMusbEp {
     uint16_t txmaxp;        /* indexed 0x10 */
     uint16_t txcsr;         /* indexed 0x12 (CSR0 for EP0) */
@@ -86,9 +105,13 @@ typedef struct AM335xMusbEp {
     uint16_t rxfifoadd;     /* mc 0x66 (indexed) */
     uint8_t  busctl[8];     /* mc 0x80+8*ep: TXFUNCADDR..RXHUBPORT */
 
-    uint8_t  fifo[AM335X_MUSB_FIFO_SIZE];
-    uint32_t fifo_len;      /* valid bytes in fifo                       */
-    uint32_t fifo_rd;       /* RX drain cursor                           */
+    /*
+     * tx = OUT direction (guest fills fifo, host sends; EP0 SETUP/OUT/
+     * OUT-status use this half). rx = IN direction (host fills fifo, guest
+     * reads; EP0 IN/IN-status use this half).
+     */
+    AM335xMusbHalf tx;
+    AM335xMusbHalf rx;
 } AM335xMusbEp;
 
 /*
@@ -125,16 +148,9 @@ typedef struct AM335xMusb {
     /* USB host framework */
     USBBus    bus;
     USBPort   port;
-    USBPacket packet;           /* single in-flight PIO transfer          */
-    QEMUBH   *async_bh;         /* completes async/retried transfers      */
-    QEMUTimer *nak_timer;       /* re-drives a NAK'd control/bulk/int poll */
+    QEMUTimer *nak_timer;       /* re-polls NAK'd / woken bulk+int endpoints */
 
-    /* in-flight transfer bookkeeping (valid while async/NAK pending) */
-    bool     xfer_active;
-    bool     xfer_is_rx;        /* IN (device->host) vs OUT/SETUP         */
-    uint8_t  xfer_ep;           /* hardware endpoint index                */
-    uint8_t  xfer_devaddr;
-    uint8_t  xfer_pid;          /* USB_TOKEN_SETUP/IN/OUT                 */
+    bool     connected;         /* CONNECT signalled for the attached dev  */
 } AM335xMusb;
 
 struct AM335xUsbssState {

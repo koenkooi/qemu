@@ -161,6 +161,76 @@
 #define USB_CONFIGDATA_VALUE  0xde        /* MPRXE|MPTXE|HBRXE|HBTXE|DYNFIFO|SOFTCONE */
 #define USB_HWVERS_VALUE      0x0800      /* RTL 2.0 (low 16b of USBnREV)  */
 
+/* musb register bit fields (musb_regs.h). */
+#define MUSB_POWER_HSENAB      0x20
+#define MUSB_POWER_HSMODE      0x10
+#define MUSB_POWER_RESET       0x08
+
+#define MUSB_INTR_RESET        0x04
+#define MUSB_INTR_CONNECT      0x10
+#define MUSB_INTR_DISCONNECT   0x20
+
+#define MUSB_DEVCTL_BDEVICE    0x80
+#define MUSB_DEVCTL_FSDEV      0x40
+#define MUSB_DEVCTL_LSDEV      0x20
+#define MUSB_DEVCTL_VBUS       0x18   /* VBUS-valid field (3 << 3)          */
+#define MUSB_DEVCTL_HM         0x04
+#define MUSB_DEVCTL_SESSION    0x01
+
+/* CSR0 (EP0), host mode. */
+#define MUSB_CSR0_H_STATUSPKT  0x0040
+#define MUSB_CSR0_H_REQPKT     0x0020
+#define MUSB_CSR0_H_ERROR      0x0010
+#define MUSB_CSR0_H_SETUPPKT   0x0008
+#define MUSB_CSR0_H_RXSTALL    0x0004
+#define MUSB_CSR0_TXPKTRDY     0x0002
+#define MUSB_CSR0_RXPKTRDY     0x0001
+
+/* TXCSR / RXCSR, host mode. */
+#define MUSB_TXCSR_MODE        0x2000
+#define MUSB_TXCSR_H_RXSTALL   0x0020
+#define MUSB_TXCSR_H_ERROR     0x0004
+#define MUSB_TXCSR_TXPKTRDY    0x0001
+
+#define MUSB_RXCSR_H_RXSTALL   0x0040
+#define MUSB_RXCSR_H_REQPKT    0x0020
+#define MUSB_RXCSR_DATAERROR   0x0008
+#define MUSB_RXCSR_H_ERROR     0x0004
+#define MUSB_RXCSR_FIFOFULL    0x0002
+#define MUSB_RXCSR_RXPKTRDY    0x0001
+
+/*
+ * "Write zero to clear" status bits: the guest read-modify-writes the CSR
+ * with these bits set to *preserve* them, and clear to reset them; the
+ * model owns setting them (musb_regs.h MUSB_*_H_WZC_BITS). New value =
+ * (written & ~WZC) | (old & written & WZC).
+ */
+#define MUSB_CSR0_H_WZC_BITS   (0x0080 | MUSB_CSR0_H_RXSTALL | MUSB_CSR0_RXPKTRDY)
+#define MUSB_TXCSR_FIFONOTEMPTY 0x0002
+#define MUSB_TXCSR_H_WZC_BITS  (0x0080 | MUSB_TXCSR_H_RXSTALL | \
+                                MUSB_TXCSR_H_ERROR | MUSB_TXCSR_FIFONOTEMPTY)
+#define MUSB_RXCSR_H_WZC_BITS  (MUSB_RXCSR_H_RXSTALL | MUSB_RXCSR_DATAERROR | \
+                                MUSB_RXCSR_H_ERROR | MUSB_RXCSR_RXPKTRDY)
+
+/* busctl per-EP offsets (musb_regs.h). */
+#define MUSB_TXFUNCADDR        0x00
+#define MUSB_RXFUNCADDR        0x04
+
+/* TXTYPE/RXTYPE fields (musb_regs.h): protocol (bits 5:4) + remote endpoint. */
+#define MUSB_TYPE_PROTO        0x30
+#define MUSB_TYPE_PROTO_SHIFT  4
+#define MUSB_TYPE_REMOTE_END   0x0f
+
+/*
+ * NAK re-poll cadence for endpoints that return no data yet. Retries always
+ * go through a QEMU_CLOCK_VIRTUAL timer (never a bottom half), so guest time
+ * advances between polls -- a self-rescheduling bottom half would freeze the
+ * virtual clock. 8ms keeps interrupt/bulk endpoints responsive without a
+ * poll storm; an endpoint wakeup re-polls sooner (125us).
+ */
+#define AM335X_MUSB_NAK_RETRY_NS   8000000  /* 8ms  */
+#define AM335X_MUSB_WAKE_RETRY_NS   125000  /* 125us */
+
 /* ======================================================================= */
 /* Flat "glue" byte-store helpers (USB0/ti-sysc/PHY/CPPI clean-probe).      */
 
@@ -270,28 +340,376 @@ static void am335x_musb_update_irq(AM335xUsbssState *s)
     qemu_set_irq(s->irq[1], pending);
 }
 
+/* Post a TX-endpoint (or EP0/control) completion into epintr_status. */
+static void am335x_musb_raise_tx(AM335xUsbssState *s, unsigned ep)
+{
+    s->musb.epintr_status |= (1u << ep) & MUSB_EPINTR_TX_MASK;
+    am335x_musb_update_irq(s);
+}
+
+/* Post an RX-endpoint completion into epintr_status. */
+static void am335x_musb_raise_rx(AM335xUsbssState *s, unsigned ep)
+{
+    s->musb.epintr_status |= (1u << (MUSB_EPINTR_RX_SHIFT + ep)) &
+                             MUSB_EPINTR_RX_MASK;
+    am335x_musb_update_irq(s);
+}
+
+/* Post a USB-core (INTRUSB) event into coreintr_status. */
+static void am335x_musb_raise_core(AM335xUsbssState *s, uint32_t intrusb_bits)
+{
+    s->musb.coreintr_status |= intrusb_bits & MUSB_COREINTR_USB_MASK;
+    am335x_musb_update_irq(s);
+}
+
+/* ======================================================================= */
+/* USB1 musb host: connect detection.                                      */
+
+/* The single device (if any) attached to the port, addressed by `addr`. */
+static USBDevice *am335x_musb_find_dev(AM335xUsbssState *s, uint8_t addr)
+{
+    if (!s->musb.port.dev || !s->musb.port.dev->attached) {
+        return NULL;
+    }
+    return usb_find_device(&s->musb.port, addr);
+}
+
+/* EP0 max packet, used to chunk control-IN reads one packet at a time. */
+static unsigned am335x_musb_ep0_maxp(USBDevice *dev)
+{
+    unsigned mp = dev->ep_ctl.max_packet_size;
+
+    return mp ? mp : 64;
+}
+
+/*
+ * Signal a host-mode connect once a device is attached AND the guest has
+ * started a session (DEVCTL.SESSION). The device is coldplugged before the
+ * driver runs, so the connect is deferred to musb_start()'s DEVCTL.SESSION
+ * write; the CONNECT status bit latches in coreintr_status until the guest
+ * enables + acks it. musb_handle_intr_connect() (musb_core.c:885-936)
+ * requires DEVCTL to read back VBUS-valid (0x18), host-mode, and the
+ * device's speed (LSDEV set only for low speed).
+ */
+static void am335x_musb_eval_connect(AM335xUsbssState *s)
+{
+    AM335xMusb *m = &s->musb;
+    USBDevice *dev = m->port.dev;
+
+    if (!dev || !dev->attached || m->connected ||
+        !(m->devctl & MUSB_DEVCTL_SESSION)) {
+        return;
+    }
+    m->connected = true;
+
+    m->devctl &= ~(MUSB_DEVCTL_BDEVICE | MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV);
+    m->devctl |= MUSB_DEVCTL_HM | MUSB_DEVCTL_VBUS;
+    if (dev->speed == USB_SPEED_LOW) {
+        m->devctl |= MUSB_DEVCTL_LSDEV;
+    } else {
+        m->devctl |= MUSB_DEVCTL_FSDEV;
+    }
+    am335x_musb_raise_core(s, MUSB_INTR_CONNECT);
+}
+
 /* ======================================================================= */
 /* USB1 musb host: PIO transfer engine.                                    */
 /*
- * Filled in the following commit. These entry points are invoked from the
- * CSR0/TXCSR/RXCSR write paths when the guest sets a "go" bit (TXPKTRDY /
- * H_REQPKT / H_SETUPPKT / H_STATUSPKT). For now they are inert, so the
- * register file and USBBus scaffolding can be exercised on their own
- * without attempting (and failing) any enumeration.
+ * The guest drives one PIO transfer at a time per the poll-based musb host
+ * driver, so a single in-flight USBPacket (m->packet) suffices. A CSR "go"
+ * bit (SETUPPKT/REQPKT/STATUSPKT/TXPKTRDY) invokes the poke hook for its
+ * endpoint, which issues a USBPacket; the result -- synchronous, async, or
+ * NAK-retry -- is turned back into CSR/FIFO/COUNT register state plus the
+ * matching wrapper interrupt (epintr_status TX bit n / RX bit 16+n).
+ */
+
+/* xfer_kind: which phase/direction the in-flight m->packet represents. */
+enum {
+    XFER_EP0_SETUP,
+    XFER_EP0_IN,
+    XFER_EP0_OUT,
+    XFER_EP0_STATUS_IN,
+    XFER_EP0_STATUS_OUT,
+    XFER_TX,            /* bulk/interrupt OUT on ep >= 1 */
+    XFER_RX,            /* bulk/interrupt IN  on ep >= 1 */
+};
+
+static void am335x_musb_issue(AM335xUsbssState *s, unsigned ep, bool is_rx);
+static void am335x_musb_arm(AM335xUsbssState *s);
+
+/*
+ * How long before the `is_rx` half of endpoint `ep` may be (re)issued.
+ * Interrupt endpoints are paced to their polling interval (TX/RXINTERVAL, in
+ * frames == ms at full speed) so a still-pending device (e.g. a hub reporting
+ * an un-serviced port change) cannot be re-polled in a tight loop that
+ * starves the guest's hub thread; a 4ms floor guards against a driver
+ * programming interval 0/1. Control (EP0) and bulk use the NAK retry cadence.
+ */
+static int64_t am335x_musb_poll_ns(AM335xUsbssState *s, unsigned ep, bool is_rx)
+{
+    AM335xMusbEp *e = &s->musb.ep[ep];
+    unsigned type = is_rx ? e->rxtype : e->txtype;
+    unsigned intv = is_rx ? e->rxinterval : e->txinterval;
+
+    if (ep == 0) {
+        return AM335X_MUSB_NAK_RETRY_NS;
+    }
+    if (((type & MUSB_TYPE_PROTO) >> MUSB_TYPE_PROTO_SHIFT) ==
+        USB_ENDPOINT_XFER_INT) {
+        unsigned ms = intv ? intv : 1;
+        return (int64_t)(ms < 4 ? 4 : ms) * 1000000;
+    }
+    return AM335X_MUSB_NAK_RETRY_NS;
+}
+
+/* Post an error completion on the `is_rx` half of `ep` (device absent). */
+static void am335x_musb_fail_nodev(AM335xUsbssState *s, unsigned ep, bool is_rx)
+{
+    AM335xMusbEp *e = &s->musb.ep[ep];
+
+    (is_rx ? &e->rx : &e->tx)->active = false;
+
+    if (ep == 0) {
+        e->txcsr &= ~(MUSB_CSR0_TXPKTRDY | MUSB_CSR0_H_SETUPPKT |
+                      MUSB_CSR0_H_REQPKT | MUSB_CSR0_H_STATUSPKT);
+        e->txcsr |= MUSB_CSR0_H_ERROR;
+        am335x_musb_raise_tx(s, 0);
+    } else if (!is_rx) {
+        e->txcsr &= ~MUSB_TXCSR_TXPKTRDY;
+        e->txcsr |= MUSB_TXCSR_H_ERROR;
+        am335x_musb_raise_tx(s, ep);
+    } else {
+        e->rxcsr &= ~MUSB_RXCSR_H_REQPKT;
+        e->rxcsr |= MUSB_RXCSR_H_ERROR;
+        am335x_musb_raise_rx(s, ep);
+    }
+}
+
+/* Turn the `is_rx` half of `ep`'s finished packet into CSR/FIFO/IRQ state. */
+static void am335x_musb_finish(AM335xUsbssState *s, unsigned ep, bool is_rx)
+{
+    AM335xMusbEp *e = &s->musb.ep[ep];
+    AM335xMusbHalf *h = is_rx ? &e->rx : &e->tx;
+    USBPacket *p = &h->packet;
+    int status = p->status;
+    int actual = p->actual_length;
+
+    if (status == USB_RET_NAK) {
+        /* Device has nothing to give/take yet: re-poll at the endpoint's
+         * pace (interrupt interval / generic NAK cadence). Stays active. */
+        usb_packet_cleanup(p);
+        h->next_poll = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                       am335x_musb_poll_ns(s, ep, is_rx);
+        am335x_musb_arm(s);
+        return;
+    }
+
+    if (ep == 0) {
+        uint16_t csr = e->txcsr;
+
+        csr &= ~(MUSB_CSR0_TXPKTRDY | MUSB_CSR0_H_SETUPPKT |
+                 MUSB_CSR0_H_REQPKT | MUSB_CSR0_H_STATUSPKT);
+        if (status == USB_RET_STALL) {
+            csr |= MUSB_CSR0_H_RXSTALL;
+            e->rxcount = e->rx.fifo_len = e->rx.fifo_rd = 0;
+        } else if (status < 0) {
+            csr |= MUSB_CSR0_H_ERROR;
+            e->rxcount = e->rx.fifo_len = e->rx.fifo_rd = 0;
+        } else if (h->kind == XFER_EP0_IN) {
+            e->rx.fifo_len = actual;    /* IN data goes to the RX FIFO */
+            e->rx.fifo_rd = 0;
+            e->rxcount = actual;
+            csr |= MUSB_CSR0_RXPKTRDY;
+        } else {
+            e->tx.fifo_len = e->tx.fifo_rd = 0;   /* SETUP/OUT/STATUS consumed */
+        }
+        e->txcsr = csr;
+        am335x_musb_raise_tx(s, 0);
+    } else if (!is_rx) {                     /* bulk/interrupt OUT */
+        e->txcsr &= ~MUSB_TXCSR_TXPKTRDY;
+        e->tx.fifo_len = e->tx.fifo_rd = 0;
+        if (status == USB_RET_STALL) {
+            e->txcsr |= MUSB_TXCSR_H_RXSTALL;
+        } else if (status < 0) {
+            e->txcsr |= MUSB_TXCSR_H_ERROR;
+        }
+        am335x_musb_raise_tx(s, ep);
+    } else {                                 /* bulk/interrupt IN */
+        e->rxcsr &= ~MUSB_RXCSR_H_REQPKT;
+        if (status == USB_RET_STALL) {
+            e->rxcsr |= MUSB_RXCSR_H_RXSTALL;
+        } else if (status < 0) {
+            e->rxcsr |= MUSB_RXCSR_H_ERROR;
+        } else {
+            e->rx.fifo_len = actual;
+            e->rx.fifo_rd = 0;
+            e->rxcount = actual;
+            e->rxcsr |= MUSB_RXCSR_RXPKTRDY;
+        }
+        am335x_musb_raise_rx(s, ep);
+    }
+
+    usb_packet_cleanup(p);
+    h->active = false;
+}
+
+/*
+ * Build + submit the `is_rx` half of endpoint `ep`. OUT-direction data is
+ * sourced from the TX FIFO (where guest writes land); IN-direction data is
+ * delivered into the RX FIFO (where guest reads drain). The device address
+ * comes from the endpoint's busctl block and the target device endpoint from
+ * TXTYPE/RXTYPE (host multipoint routing); EP0 uses busctl slot 0.
+ */
+static void am335x_musb_issue(AM335xUsbssState *s, unsigned ep, bool is_rx)
+{
+    AM335xMusb *m = &s->musb;
+    AM335xMusbEp *e = &m->ep[ep];
+    AM335xMusbHalf *h = is_rx ? &e->rx : &e->tx;
+    USBPacket *p = &h->packet;
+    USBDevice *dev;
+    USBEndpoint *uep;
+    uint8_t *buf = NULL;
+    unsigned devaddr, target_ep, len = 0;
+    int pid;
+
+    switch (h->kind) {
+    case XFER_EP0_SETUP:
+        pid = USB_TOKEN_SETUP;
+        devaddr = m->ep[0].busctl[MUSB_TXFUNCADDR];
+        target_ep = 0;
+        buf = e->tx.fifo;
+        len = 8;
+        break;
+    case XFER_EP0_IN:
+    case XFER_EP0_STATUS_IN:
+        pid = USB_TOKEN_IN;
+        devaddr = m->ep[0].busctl[MUSB_TXFUNCADDR];
+        target_ep = 0;
+        buf = e->rx.fifo;
+        break;
+    case XFER_EP0_OUT:
+    case XFER_EP0_STATUS_OUT:
+        pid = USB_TOKEN_OUT;
+        devaddr = m->ep[0].busctl[MUSB_TXFUNCADDR];
+        target_ep = 0;
+        buf = e->tx.fifo;
+        len = (h->kind == XFER_EP0_OUT) ? e->tx.fifo_len : 0;
+        break;
+    case XFER_TX:
+        pid = USB_TOKEN_OUT;
+        devaddr = e->busctl[MUSB_TXFUNCADDR];
+        target_ep = e->txtype & MUSB_TYPE_REMOTE_END;
+        buf = e->tx.fifo;
+        len = e->tx.fifo_len;
+        break;
+    case XFER_RX:
+    default:
+        pid = USB_TOKEN_IN;
+        devaddr = e->busctl[MUSB_RXFUNCADDR];
+        target_ep = e->rxtype & MUSB_TYPE_REMOTE_END;
+        buf = e->rx.fifo;
+        break;
+    }
+
+    dev = am335x_musb_find_dev(s, devaddr);
+    if (!dev) {
+        am335x_musb_fail_nodev(s, ep, is_rx);
+        return;
+    }
+    uep = usb_ep_get(dev, pid, target_ep);
+
+    if (h->kind == XFER_EP0_IN) {
+        len = am335x_musb_ep0_maxp(dev);
+    } else if (h->kind == XFER_RX) {
+        len = e->rxmaxp & 0x7ff;
+    }
+
+    usb_packet_init(p);
+    /* short_not_ok is false for IN (a short packet legitimately ends the
+     * transfer); true otherwise -- mirrors hcd-dwc2.c. */
+    usb_packet_setup(p, pid, uep, 0, 0, pid != USB_TOKEN_IN, true);
+    if (len) {
+        usb_packet_addbuf(p, buf, len);
+    }
+    h->active = true;
+    usb_handle_packet(dev, p);
+
+    if (p->status == USB_RET_ASYNC) {
+        return;                         /* completed via the port .complete op */
+    }
+    am335x_musb_finish(s, ep, is_rx);
+}
+
+/*
+ * CSR0 write with a "go" bit -> drive the next EP0 control-transfer phase.
+ * EP0 is half-duplex control, so all phases share the endpoint's TX-half
+ * slot; the IN data phase still delivers into the RX FIFO (see finish()).
  */
 static void am335x_musb_ep0_poke(AM335xUsbssState *s)
 {
-    /* TODO(next commit): drive the EP0 control-transfer state machine. */
+    AM335xMusbEp *e0 = &s->musb.ep[0];
+    uint16_t csr = e0->txcsr;
+
+    if (e0->tx.active) {
+        return;
+    }
+    if (csr & MUSB_CSR0_H_SETUPPKT) {
+        e0->tx.kind = XFER_EP0_SETUP;
+        am335x_musb_issue(s, 0, false);
+    } else if (csr & MUSB_CSR0_H_STATUSPKT) {
+        e0->tx.kind = (csr & MUSB_CSR0_H_REQPKT) ? XFER_EP0_STATUS_IN
+                                                 : XFER_EP0_STATUS_OUT;
+        am335x_musb_issue(s, 0, false);
+    } else if (csr & MUSB_CSR0_H_REQPKT) {
+        e0->tx.kind = XFER_EP0_IN;
+        am335x_musb_issue(s, 0, false);
+    } else if (csr & MUSB_CSR0_TXPKTRDY) {
+        e0->tx.kind = XFER_EP0_OUT;
+        am335x_musb_issue(s, 0, false);
+    }
 }
 
+/* TXCSR.TXPKTRDY write -> launch a bulk/interrupt OUT packet on EP `ep`. */
 static void am335x_musb_tx_poke(AM335xUsbssState *s, unsigned ep)
 {
-    /* TODO(next commit): drive a bulk/interrupt OUT transfer on EP `ep`. */
+    AM335xMusbEp *e = &s->musb.ep[ep];
+
+    if (e->tx.active) {
+        return;
+    }
+    if (e->txcsr & MUSB_TXCSR_TXPKTRDY) {
+        e->tx.kind = XFER_TX;
+        am335x_musb_issue(s, ep, false);
+    }
 }
 
+/* RXCSR.H_REQPKT write -> request a bulk/interrupt IN packet on EP `ep`. */
 static void am335x_musb_rx_poke(AM335xUsbssState *s, unsigned ep)
 {
-    /* TODO(next commit): drive a bulk/interrupt IN transfer on EP `ep`. */
+    AM335xMusbEp *e = &s->musb.ep[ep];
+
+    if (e->rx.active) {
+        return;
+    }
+    if (e->rxcsr & MUSB_RXCSR_H_REQPKT) {
+        e->rx.kind = XFER_RX;
+        /*
+         * An interrupt IN is paced to its polling interval rather than
+         * issued at once: the guest resubmits it as soon as it completes,
+         * so issuing immediately would busy-loop against a device that
+         * keeps returning the same data (e.g. a hub's port-change endpoint
+         * before the hub thread clears the change). Bulk IN issues now.
+         */
+        if (((e->rxtype & MUSB_TYPE_PROTO) >> MUSB_TYPE_PROTO_SHIFT) ==
+            USB_ENDPOINT_XFER_INT) {
+            e->rx.active = true;
+            e->rx.next_poll = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                              am335x_musb_poll_ns(s, ep, true);
+            am335x_musb_arm(s);
+        } else {
+            am335x_musb_issue(s, ep, true);
+        }
+    }
 }
 
 /* ======================================================================= */
@@ -448,20 +866,28 @@ static void am335x_musb_indexed_write(AM335xUsbssState *s, hwaddr ioff,
         ep->txmaxp = value;
         break;
     case IDX_TXCSR:
-        ep->txcsr = value;
         if (m->index == 0) {
+            uint16_t wzc = MUSB_CSR0_H_WZC_BITS;
+            ep->txcsr = ((uint16_t)value & ~wzc) |
+                        (ep->txcsr & (uint16_t)value & wzc);
             am335x_musb_ep0_poke(s);
         } else {
+            uint16_t wzc = MUSB_TXCSR_H_WZC_BITS;
+            ep->txcsr = ((uint16_t)value & ~wzc) |
+                        (ep->txcsr & (uint16_t)value & wzc);
             am335x_musb_tx_poke(s, m->index);
         }
         break;
     case IDX_RXMAXP:
         ep->rxmaxp = value;
         break;
-    case IDX_RXCSR:
-        ep->rxcsr = value;
+    case IDX_RXCSR: {
+        uint16_t wzc = MUSB_RXCSR_H_WZC_BITS;
+        ep->rxcsr = ((uint16_t)value & ~wzc) |
+                    (ep->rxcsr & (uint16_t)value & wzc);
         am335x_musb_rx_poke(s, m->index);
         break;
+    }
     case IDX_RXCOUNT:
         ep->rxcount = value;
         break;
@@ -482,32 +908,32 @@ static void am335x_musb_indexed_write(AM335xUsbssState *s, hwaddr ioff,
     }
 }
 
-/* FIFO port read (RX drain): mc + 0x20 + 4*ep, `size` bytes per access. */
+/* FIFO port read (drains the RX FIFO): mc + 0x20 + 4*ep, `size` bytes. */
 static uint64_t am335x_musb_fifo_read(AM335xUsbssState *s, unsigned ep,
                                       unsigned size)
 {
-    AM335xMusbEp *e = &s->musb.ep[ep];
+    AM335xMusbHalf *h = &s->musb.ep[ep].rx;
     uint64_t v = 0;
 
     for (unsigned i = 0; i < size; i++) {
         uint8_t b = 0;
-        if (e->fifo_rd < e->fifo_len) {
-            b = e->fifo[e->fifo_rd++];
+        if (h->fifo_rd < h->fifo_len) {
+            b = h->fifo[h->fifo_rd++];
         }
         v |= (uint64_t)b << (8 * i);
     }
     return v;
 }
 
-/* FIFO port write (TX fill): appends `size` bytes to the endpoint FIFO. */
+/* FIFO port write (fills the TX FIFO): appends `size` bytes. */
 static void am335x_musb_fifo_write(AM335xUsbssState *s, unsigned ep,
                                    uint64_t value, unsigned size)
 {
-    AM335xMusbEp *e = &s->musb.ep[ep];
+    AM335xMusbHalf *h = &s->musb.ep[ep].tx;
 
     for (unsigned i = 0; i < size; i++) {
-        if (e->fifo_len < AM335X_MUSB_FIFO_SIZE) {
-            e->fifo[e->fifo_len++] = (value >> (8 * i)) & 0xff;
+        if (h->fifo_len < AM335X_MUSB_FIFO_SIZE) {
+            h->fifo[h->fifo_len++] = (value >> (8 * i)) & 0xff;
         }
     }
 }
@@ -596,9 +1022,31 @@ static void am335x_musb_mc_write(void *opaque, hwaddr offset,
     case MC_FADDR:
         m->faddr = val;
         break;
-    case MC_POWER:
+    case MC_POWER: {
+        uint8_t old = m->power;
+
         m->power = val;
+        /*
+         * Port reset: the guest asserts POWER.RESET, waits (delayed work),
+         * then deasserts it (musb_port_reset, musb_virthub.c:167-186). On
+         * the deassert edge, reset the attached device and present
+         * POWER.HSMODE for its speed -- the only register the driver reads
+         * back to decide the port speed.
+         */
+        if ((old & MUSB_POWER_RESET) && !(val & MUSB_POWER_RESET)) {
+            USBDevice *dev = m->port.dev;
+
+            if (dev && dev->attached) {
+                usb_device_reset(dev);
+                if (dev->speed == USB_SPEED_HIGH) {
+                    m->power |= MUSB_POWER_HSMODE;
+                } else {
+                    m->power &= ~MUSB_POWER_HSMODE;
+                }
+            }
+        }
         break;
+    }
     case MC_INTRTX:                 /* status registers: read-to-clear, RO */
     case MC_INTRRX:
     case MC_INTRUSB:
@@ -622,6 +1070,9 @@ static void am335x_musb_mc_write(void *opaque, hwaddr offset,
         break;
     case MC_DEVCTL:
         m->devctl = val;
+        /* musb_start()'s host branch sets DEVCTL.SESSION; that is our cue
+         * that the guest is ready to see the coldplugged device connect. */
+        am335x_musb_eval_connect(s);
         break;
     case MC_BABBLE_CTL:
         m->babble_ctl = val;
@@ -656,24 +1107,87 @@ static const MemoryRegionOps am335x_musb_mc_ops = {
 /* ======================================================================= */
 /* USB1 musb host: USBBus / USBPort.                                       */
 
-static void am335x_musb_bh(void *opaque)
+/* Arm the shared poll timer for the earliest pending half's deadline. */
+static void am335x_musb_arm(AM335xUsbssState *s)
 {
-    /* TODO(next commit): service async/retried transfers. */
+    int64_t best = INT64_MAX;
+
+    for (unsigned ep = 0; ep < AM335X_MUSB_NUM_EP; ep++) {
+        AM335xMusbEp *e = &s->musb.ep[ep];
+
+        if (e->tx.active && !usb_packet_is_inflight(&e->tx.packet) &&
+            e->tx.next_poll < best) {
+            best = e->tx.next_poll;
+        }
+        if (e->rx.active && !usb_packet_is_inflight(&e->rx.packet) &&
+            e->rx.next_poll < best) {
+            best = e->rx.next_poll;
+        }
+    }
+    if (best != INT64_MAX) {
+        timer_mod(s->musb.nak_timer, best);
+    }
+}
+
+/*
+ * Re-issue every endpoint half whose (re)poll deadline has arrived and whose
+ * packet is not still async-inflight. Runs off the QEMU_CLOCK_VIRTUAL timer
+ * so guest time advances between polls; per-half next_poll deadlines keep
+ * interrupt endpoints at their interval.
+ */
+static void am335x_musb_retry_all(AM335xUsbssState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (unsigned ep = 0; ep < AM335X_MUSB_NUM_EP; ep++) {
+        AM335xMusbEp *e = &s->musb.ep[ep];
+
+        if (e->tx.active && !usb_packet_is_inflight(&e->tx.packet) &&
+            now >= e->tx.next_poll) {
+            am335x_musb_issue(s, ep, false);
+        }
+        if (e->rx.active && !usb_packet_is_inflight(&e->rx.packet) &&
+            now >= e->rx.next_poll) {
+            am335x_musb_issue(s, ep, true);
+        }
+    }
+    am335x_musb_arm(s);
 }
 
 static void am335x_musb_nak_timer(void *opaque)
 {
-    /* TODO(next commit): re-drive a NAK'd control/bulk/interrupt poll. */
+    am335x_musb_retry_all(opaque);
+}
+
+/* A device signalled an endpoint has data/space: run the poll pass soon
+ * (via the timer, never a bottom half, so the virtual clock keeps
+ * advancing). Per-endpoint next_poll deadlines still gate each endpoint. */
+static void am335x_musb_wake(AM335xUsbssState *s)
+{
+    timer_mod(s->musb.nak_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                 AM335X_MUSB_WAKE_RETRY_NS);
 }
 
 static void am335x_musb_attach(USBPort *port)
 {
-    /* TODO(next commit): raise INTRUSB.CONNECT and reflect port speed. */
+    AM335xUsbssState *s = port->opaque;
+
+    if (!port->dev || !port->dev->attached) {
+        return;
+    }
+    /* If the session is already active, connect now; otherwise the connect
+     * is raised when the guest sets DEVCTL.SESSION (see eval_connect). */
+    am335x_musb_eval_connect(s);
 }
 
 static void am335x_musb_detach(USBPort *port)
 {
-    /* TODO(next commit): raise INTRUSB.DISCONNECT. */
+    AM335xUsbssState *s = port->opaque;
+    AM335xMusb *m = &s->musb;
+
+    m->connected = false;
+    m->devctl &= ~(MUSB_DEVCTL_VBUS | MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV);
+    am335x_musb_raise_core(s, MUSB_INTR_DISCONNECT);
 }
 
 static void am335x_musb_child_detach(USBPort *port, USBDevice *child)
@@ -682,11 +1196,34 @@ static void am335x_musb_child_detach(USBPort *port, USBDevice *child)
 
 static void am335x_musb_wakeup(USBPort *port)
 {
+    AM335xUsbssState *s = port->opaque;
+
+    am335x_musb_wake(s);
 }
 
 static void am335x_musb_async_complete(USBPort *port, USBPacket *packet)
 {
-    /* TODO(next commit): finish an async transfer and post its completion. */
+    AM335xUsbssState *s = port->opaque;
+
+    for (unsigned ep = 0; ep < AM335X_MUSB_NUM_EP; ep++) {
+        AM335xMusbEp *e = &s->musb.ep[ep];
+
+        for (unsigned r = 0; r < 2; r++) {
+            AM335xMusbHalf *h = r ? &e->rx : &e->tx;
+
+            if (&h->packet != packet) {
+                continue;
+            }
+            if (packet->status == USB_RET_REMOVE_FROM_QUEUE) {
+                usb_cancel_packet(packet);
+                usb_packet_cleanup(packet);
+                h->active = false;
+                return;
+            }
+            am335x_musb_finish(s, ep, r != 0);
+            return;
+        }
+    }
 }
 
 static USBPortOps am335x_musb_port_ops = {
@@ -701,8 +1238,9 @@ static void am335x_musb_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
                                         unsigned int stream)
 {
     AM335xMusb *m = container_of(bus, AM335xMusb, bus);
+    AM335xUsbssState *s = container_of(m, AM335xUsbssState, musb);
 
-    qemu_bh_schedule(m->async_bh);
+    am335x_musb_wake(s);
 }
 
 static USBBusOps am335x_musb_bus_ops = {
@@ -739,6 +1277,10 @@ static void am335x_musb_reset(AM335xUsbssState *s)
     m->devctl = 0;
     m->babble_ctl = 0;
 
+    if (m->nak_timer) {
+        timer_del(m->nak_timer);
+    }
+
     for (unsigned i = 0; i < AM335X_MUSB_NUM_EP; i++) {
         AM335xMusbEp *e = &m->ep[i];
         e->txmaxp = e->txcsr = e->rxmaxp = e->rxcsr = e->rxcount = 0;
@@ -746,11 +1288,19 @@ static void am335x_musb_reset(AM335xUsbssState *s)
         e->txfifosz = e->rxfifosz = 0;
         e->txfifoadd = e->rxfifoadd = 0;
         memset(e->busctl, 0, sizeof(e->busctl));
-        e->fifo_len = 0;
-        e->fifo_rd = 0;
+        for (unsigned r = 0; r < 2; r++) {
+            AM335xMusbHalf *h = r ? &e->rx : &e->tx;
+            h->fifo_len = 0;
+            h->fifo_rd = 0;
+            if (usb_packet_is_inflight(&h->packet)) {
+                usb_cancel_packet(&h->packet);
+                usb_packet_cleanup(&h->packet);
+            }
+            h->active = false;
+        }
     }
 
-    m->xfer_active = false;
+    m->connected = false;
 }
 
 static void am335x_usbss_reset(DeviceState *dev)
@@ -806,8 +1356,6 @@ static void am335x_usbss_realize(DeviceState *dev, Error **errp)
                       USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL |
                       USB_SPEED_MASK_HIGH);
 
-    m->async_bh = qemu_bh_new_guarded(am335x_musb_bh, s,
-                                      &dev->mem_reentrancy_guard);
     m->nak_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, am335x_musb_nak_timer, s);
 }
 
@@ -818,10 +1366,6 @@ static void am335x_usbss_unrealize(DeviceState *dev)
     if (s->musb.nak_timer) {
         timer_free(s->musb.nak_timer);
         s->musb.nak_timer = NULL;
-    }
-    if (s->musb.async_bh) {
-        qemu_bh_delete(s->musb.async_bh);
-        s->musb.async_bh = NULL;
     }
 }
 
