@@ -1584,6 +1584,9 @@ static void am335x_cppi_teardown(AM335xUsbssState *s, unsigned port, bool is_tx)
     }
     if (s->cppi.td_desc_phys) {
         am335x_cppi_defer_completion(s, CPPI_TD_COMPLETE_Q, s->cppi.td_desc_phys);
+        /* Consumed: don't let a GCR_TEARDOWN write with no preceding
+         * queue-31 push re-post this same descriptor a second time. */
+        s->cppi.td_desc_phys = 0;
     }
 }
 
@@ -2001,6 +2004,8 @@ static void am335x_usbss_unrealize(DeviceState *dev)
         g_free(e->rx.cppi_buf);
         e->rx.cppi_buf = NULL;
     }
+    g_free(s->regs);
+    s->regs = NULL;
 }
 
 static void am335x_usbss_class_init(ObjectClass *klass, void *data)

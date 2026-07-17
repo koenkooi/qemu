@@ -11,9 +11,13 @@
  *  - The PHY identifier registers PHYIDR1/PHYIDR2 (regs 2/3) report
  *    DP83867_PHY_ID (0x2000a231, phy_id_mask 0xfffffff0), so phylib's
  *    ID-register autoprobe binds the dp83867 driver rather than the generic
- *    one.  (The AM335x davinci_mdio bus scan reads these to identify the PHY;
- *    the SanCloud BeagleBone Enhanced DT gives the PHY no explicit
- *    compatible string, so this ID is what selects the driver.)
+ *    one.  (The AM335x davinci_mdio bus scan reads these to identify the PHY.
+ *    Used by two boards via the shared CPSW "gigabit-phy" property: the
+ *    Seeed BeagleBone Green Eco, whose DT names "ti,dp83867" outright -- the
+ *    strongest evidence for this chip in the family -- and the SanCloud
+ *    BeagleBone Enhanced, whose DT gives its PHY no explicit compatible
+ *    string, so the chip there is inferred by analogy to Green Eco's,
+ *    not confirmed from Sancloud's own BOM/schematic.)
  *  - BMCR/BMSR (regs 0/1): autonegotiation completes immediately and the
  *    status register reports link up, autoneg-complete, autoneg-able and
  *    "extended status present" (so phylib reads reg 15 for gigabit ability).

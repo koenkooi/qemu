@@ -350,9 +350,9 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /*
-     * MMCHS0/1 (SDHCI behind a TI wrapper). Needed so the guest can mount a
-     * rootfs from an SD image. The board attaches the actual SD cards to
-     * each controller's "sd-bus".
+     * MMCHS0/1/2 (SDHCI behind a TI wrapper). Needed so the guest can mount a
+     * rootfs from an SD image. The board attaches the actual SD/eMMC/SDIO
+     * cards to each controller's "sd-bus" (MMCHS2 only on Green Wireless).
      */
     for (i = 0; i < AM335X_NUM_MMC; i++) {
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->mmc[i]), errp)) {

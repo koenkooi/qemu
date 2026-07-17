@@ -22,7 +22,7 @@
  * wlcore/wl18xx driver stack to enumerate it, bind, and run its probe up to
  * (but not including) firmware download -- the same "structural, not
  * functional" bar this project uses for its other new-peripheral stubs
- * (hw/misc/am335x_usbss.c "clean probe", hw/net/dp83867_phy.c "clean attach").
+ * (hw/ssi/am335x_mcspi.c "clean probe", hw/net/dp83867_phy.c "clean attach").
  * No 802.11 MAC/PHY/RF is modelled; there is no radio here, only the register-
  * and enumeration-level behaviour the driver's probe path exercises.
  *
@@ -96,7 +96,8 @@
  * accepted and discarded, and every chip register other than CHIP_ID_B reads
  * back 0. So a clean probe reaches driver bind + chip identification and the
  * creation of the wlan interface's phy; bringing the interface up (which needs
- * the real firmware) is out of scope, exactly like the USB "clean probe" stub.
+ * the real firmware) is out of scope, the same structural boundary as this
+ * project's other clean-probe/clean-attach peripheral stubs.
  */
 
 #include "qemu/osdep.h"

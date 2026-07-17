@@ -252,11 +252,20 @@ static void am335x_mcspi_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->irq);
 }
 
+static void am335x_mcspi_unrealize(DeviceState *dev)
+{
+    AM335xMcspiState *s = AM335X_MCSPI(dev);
+
+    g_free(s->regs);
+    s->regs = NULL;
+}
+
 static void am335x_mcspi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = am335x_mcspi_realize;
+    dc->unrealize = am335x_mcspi_unrealize;
     device_class_set_legacy_reset(dc, am335x_mcspi_reset);
     /*
      * No vmsd: heap-allocated backing store, and the beaglebone-black

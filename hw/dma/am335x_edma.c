@@ -22,13 +22,17 @@
  * <&edma REQ TC>` bindings. This models the TPCC (Third-Party Channel
  * Controller, the user-facing block at 0x49000000) just far enough for the
  * mainline `ti,edma3-tpcc` dmaengine driver (drivers/dma/ti/edma.c) to probe
- * cleanly AND to drive one specific client -- the McASP0 I2S port's cyclic
- * audio playback DMA -- to periodic completion so ALSA `aplay`/`speaker-test`
- * make forward progress. It is deliberately NOT a general-purpose EDMA3: real
- * sample/byte transport is not modelled (like CPSW's RF-less Ethernet and the
- * wl18xx SDIO "clean probe"), only the register-level and completion-interrupt
- * behaviour the driver stack exercises. Remaining generality gaps are noted at
- * the bottom of this comment.
+ * cleanly and for McASP0's cyclic audio-playback DMA request to bind to a
+ * channel and register the ALSA `simple-audio-card` (verified:
+ * /proc/asound/cards lists a real card). It is deliberately NOT a
+ * general-purpose EDMA3: real sample/byte transport is not modelled (like
+ * CPSW's RF-less Ethernet and the wl18xx SDIO "clean probe"), only the
+ * register-level and completion-interrupt behaviour the driver stack
+ * exercises up to that point. Whether a live `aplay`/`speaker-test` playback
+ * completes end-to-end was NOT exercised (see hw/display/tda19988.c's audio
+ * note -- the test rootfs used had no alsa-utils); the completion-interrupt
+ * plumbing exists but is unverified beyond card registration. Remaining
+ * generality gaps are noted at the bottom of this comment.
  *
  * ---------------------------------------------------------------------------
  * The Linux driver boundary this model targets (kernel 7.x, edma.c)

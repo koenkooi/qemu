@@ -24,13 +24,17 @@
  * EDMA3 engine (hw/dma/am335x_edma.c), which is why until now the mainline
  * `davinci-mcasp` driver failed to probe with "No DMA controller found (-19)".
  *
- * This models McASP0 just far enough for that driver to probe cleanly, for
- * `snd_soc_register_component` and the ALSA `simple-audio-card` to register a
- * playback-capable sound card, and for a `dmaengine_prep_dma_cyclic` playback
- * to start and run (its periodic completions come from the EDMA model). Same
- * "structural, not functional" bar as CPSW / wl18xx-SDIO / USBSS: no real
- * audio samples are transported and nothing audible is produced -- the I2S
- * frames the driver hands to EDMA are discarded.
+ * This models McASP0 just far enough for that driver to probe cleanly and for
+ * `snd_soc_register_component` + the ALSA `simple-audio-card` to register a
+ * playback-capable sound card (verified: /proc/asound/cards lists a real
+ * card, TDA19988 bound as the codec DAI). A `dmaengine_prep_dma_cyclic`
+ * playback can start against the EDMA model's completion-interrupt plumbing,
+ * but an actual `aplay`/`speaker-test` run completing end-to-end was NOT
+ * exercised (see hw/display/tda19988.c's audio note) -- so treat that path as
+ * present-but-unverified, not confirmed-working. Same "structural, not
+ * functional" bar as CPSW / wl18xx-SDIO / USBSS either way: no real audio
+ * samples are transported and nothing audible is produced -- the I2S frames
+ * the driver hands to EDMA are discarded.
  *
  * ---------------------------------------------------------------------------
  * The Linux driver boundary this model targets (davinci-mcasp.c, kernel 7.x)
