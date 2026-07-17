@@ -1268,12 +1268,41 @@ static const MemoryRegionOps am335x_musb_mc_ops = {
  * guest's cppi41_irq()/cppi41_pop_desc() drain it.
  */
 
-/* Level-drive the CPPI "glue" completion line (INTC 17). */
+/* True if any completion queue still holds an undrained descriptor. */
+static bool am335x_cppi_cq_any_pending(AM335xUsbssState *s)
+{
+    for (unsigned q = 0; q < AM335X_CPPI_NUM_QUEUES; q++) {
+        if (s->cppi.cq[q].count) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Level-drive the CPPI "glue" completion line (INTC 17).
+ *
+ * PD_COMP re-latches from completion-queue occupancy, not just the guest's
+ * last W1C: on real hardware the status bit reflects "a completion queue has
+ * an undrained descriptor", so a guest write that clears it while another
+ * completion is still queued does not silence the line. This matters because
+ * the guest's dsps ISR callback does a plain read-then-W1C of this bit once
+ * per popped descriptor (musb_dsps.c:647-649) with the BQL dropped between
+ * the two MMIOs; without re-latching from occupancy, a bottom-half raise
+ * landing in that window is destroyed by the following W1C even though a
+ * descriptor is still sitting in a cq[] ring -- silently losing the
+ * interrupt and hanging a multi-packet (reload-chain) CPPI transfer. This
+ * only manifested intermittently under fast host timing.
+ */
 static void am335x_cppi_update_irq(AM335xUsbssState *s)
 {
-    bool pending = (s->cppi.irq_status & s->cppi.irq_enable &
-                    USBSS_IRQ_PD_COMP) != 0;
+    bool pending;
 
+    if (am335x_cppi_cq_any_pending(s)) {
+        s->cppi.irq_status |= USBSS_IRQ_PD_COMP;
+    }
+    pending = (s->cppi.irq_status & s->cppi.irq_enable &
+               USBSS_IRQ_PD_COMP) != 0;
     qemu_set_irq(s->irq[2], pending);
 }
 
@@ -1296,17 +1325,16 @@ static void am335x_cppi_cq_push(AM335xUsbssState *s, unsigned q, uint32_t desc)
     cq->count++;
 }
 
-/* Post a completed transfer descriptor and raise the PD_COMP interrupt. */
 /*
  * Bottom half: post every pending completed descriptor onto its completion
- * queue and raise PD_COMP once. Runs in the main loop, so the IRQ is asserted
- * outside any guest cppi41_irq context (see the AM335xCppi.comp[] rationale).
+ * queue, then re-derive PD_COMP from occupancy. Runs in the main loop, so the
+ * IRQ is (re)asserted outside any guest cppi41_irq context (see the
+ * AM335xCppi.comp[] rationale and am335x_cppi_update_irq()).
  */
 static void am335x_cppi_comp_bh(void *opaque)
 {
     AM335xUsbssState *s = AM335X_USBSS(opaque);
     AM335xCppi *c = &s->cppi;
-    bool posted = false;
 
     while (c->comp_count) {
         AM335xCppiComp *e = &c->comp[c->comp_head];
@@ -1314,12 +1342,8 @@ static void am335x_cppi_comp_bh(void *opaque)
         am335x_cppi_cq_push(s, e->q, e->desc);
         c->comp_head = (c->comp_head + 1) % AM335X_CPPI_COMP_RING;
         c->comp_count--;
-        posted = true;
     }
-    if (posted) {
-        c->irq_status |= USBSS_IRQ_PD_COMP;
-        am335x_cppi_update_irq(s);
-    }
+    am335x_cppi_update_irq(s);
 }
 
 /* Queue a finished descriptor for deferred completion posting (see above). */
@@ -1471,6 +1495,90 @@ static void am335x_cppi_submit(AM335xUsbssState *s, unsigned q, uint32_t val)
     /* USB0 (inert host) and unused submit slots: ignore. */
 }
 
+/* ----- CPPI DMA controller window MMIO (abs 0x47402000, 4KB) ----------- */
+/*
+ * The controller window is otherwise probe-time-only (channel-enable and
+ * RXHPCRA0 writes that nothing ever reads back, cppi41.c:391,445,668) and is
+ * served by the flat glue store like the scheduler window. The one write
+ * with data-path meaning is a TXGCR(port)/RXGCR(port) write with
+ * GCR_TEARDOWN set: cppi41_tear_down_chan() (cppi41.c:637-730) writes this
+ * right after pushing a teardown descriptor onto submit queue 31 (captured
+ * as cppi.td_desc_phys, see am335x_cppi_submit()), then polls the
+ * teardown-complete queue (0) for both the in-flight transfer's own
+ * descriptor and the teardown descriptor before considering the channel
+ * torn down.
+ */
+
+/*
+ * Abort the in-flight CPPI transfer (if any) on USB1 endpoint `port`-14's
+ * `is_tx` half, and hand the driver's teardown poll loop the descriptor(s)
+ * it looks for on the teardown-complete queue: the in-flight transfer's own
+ * descriptor (if one was outstanding) and the teardown descriptor itself
+ * (already latched from the submit-queue-31 push that precedes this GCR
+ * write per the driver's own sequencing).
+ */
+static void am335x_cppi_teardown(AM335xUsbssState *s, unsigned port, bool is_tx)
+{
+    unsigned ep;
+    AM335xMusbHalf *h;
+
+    if (port < 15 || port >= 30) {
+        return;                         /* USB0 (inert) or out of range */
+    }
+    ep = port - 14;
+    h = is_tx ? &s->musb.ep[ep].tx : &s->musb.ep[ep].rx;
+
+    if (h->cppi && h->active) {
+        if (usb_packet_is_inflight(&h->packet)) {
+            usb_cancel_packet(&h->packet);
+        }
+        usb_packet_cleanup(&h->packet);
+        am335x_cppi_defer_completion(s, CPPI_TD_COMPLETE_Q, h->cppi_desc_phys);
+        h->cppi = false;
+        h->active = false;
+    }
+    if (s->cppi.td_desc_phys) {
+        am335x_cppi_defer_completion(s, CPPI_TD_COMPLETE_Q, s->cppi.td_desc_phys);
+    }
+}
+
+static uint64_t am335x_cppi_ctrl_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    AM335xUsbssState *s = AM335X_USBSS(opaque);
+
+    return am335x_usbss_load(s->regs, CPPI_CTRL_OFFSET + offset, size);
+}
+
+static void am335x_cppi_ctrl_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+    AM335xUsbssState *s = AM335X_USBSS(opaque);
+
+    am335x_usbss_store(s->regs, CPPI_CTRL_OFFSET + offset, value, size);
+
+    if (size == 4 && (value & CPPI_GCR_TEARDOWN) &&
+        offset >= CPPI_DMA_TXGCR(0)) {
+        unsigned rel = offset - CPPI_DMA_TXGCR(0);
+        unsigned port = rel / 0x20;
+        unsigned sub = rel % 0x20;
+
+        if (sub == 0) {
+            am335x_cppi_teardown(s, port, true);   /* TXGCR(port) */
+        } else if (sub == (CPPI_DMA_RXGCR(0) - CPPI_DMA_TXGCR(0))) {
+            am335x_cppi_teardown(s, port, false);  /* RXGCR(port) */
+        }
+    }
+}
+
+static const MemoryRegionOps am335x_cppi_ctrl_ops = {
+    .read = am335x_cppi_ctrl_read,
+    .write = am335x_cppi_ctrl_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 /* ----- CPPI queue-manager window MMIO (abs 0x47404000, 16KB) ----------- */
 
 static uint64_t am335x_cppi_qmgr_read(void *opaque, hwaddr offset,
@@ -1505,6 +1613,11 @@ static uint64_t am335x_cppi_qmgr_read(void *opaque, hwaddr offset,
 
             cq->head = (cq->head + 1) % AM335X_CPPI_CQ_DEPTH;
             cq->count--;
+            /* A direct pop outside the STATUS-read/W1C ISR pairing (e.g. the
+             * teardown path's cppi41_pop_desc calls) can drain the last
+             * occupied queue; let the level react immediately rather than
+             * only on the next STATUS write. */
+            am335x_cppi_update_irq(s);
             return d;
         }
         return 0;
@@ -1790,8 +1903,13 @@ static void am335x_usbss_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->container, AM335X_USB1_MC_OFFSET,
                                         &s->musb_mc, 1);
 
-    /* CPPI4.1 queue-manager window: functional submit/completion data path
-     * (the controller/scheduler/glue windows stay flat-store clean-probe). */
+    /* CPPI4.1 queue-manager window: functional submit/completion data path.
+     * The controller window is functional only for GCR_TEARDOWN (channel
+     * abort); the scheduler/glue-probe windows stay flat-store clean-probe. */
+    memory_region_init_io(&s->cppi_ctrl, OBJECT(s), &am335x_cppi_ctrl_ops, s,
+                          "am335x-usbss-cppi-ctrl", CPPI_CTRL_SIZE);
+    memory_region_add_subregion_overlap(&s->container, CPPI_CTRL_OFFSET,
+                                        &s->cppi_ctrl, 1);
     memory_region_init_io(&s->cppi_qmgr, OBJECT(s), &am335x_cppi_qmgr_ops, s,
                           "am335x-usbss-cppi-qmgr", CPPI_QMGR_SIZE);
     memory_region_add_subregion_overlap(&s->container, CPPI_QMGR_OFFSET,
