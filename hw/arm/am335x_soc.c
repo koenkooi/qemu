@@ -96,13 +96,26 @@ static const struct {
     { 0x48042000, 69, false }, /* DMTIMER3 */
 };
 
-/* MMCHS0/1 MMIO bases and INTC input lines (TRM spruh73q ch.6/18) */
+/*
+ * MMCHS0/1/2 MMIO bases and INTC input lines (TRM spruh73q ch.6/18).
+ * All three MMC/SD host controllers exist in AM335x silicon regardless of
+ * board; which ones a board wires out is board-level policy handled in the
+ * board file's card-attach loop. MMCHS2's base 0x47810000 and INTC line 29
+ * (MMCSD2INT) are from the TRM L3/L4 memory map and Table 6-1 interrupt map,
+ * cross-checked against the mainline DT (am33xx.dtsi target-module@47810000,
+ * mmc@0 "ti,am335-sdhci" interrupts = <29>). Only the BeagleBone Green
+ * Wireless (beaglebone-green-wireless.c) actually populates MMCHS2, with the
+ * on-package TI WiLink8 (wl1835) SDIO WiFi function; on every other board the
+ * card-attach loop finds no -sd drive at index 2 and leaves it unconnected,
+ * matching real hardware where MMCHS2's pins are simply not routed out.
+ */
 static const struct {
     hwaddr addr;
     unsigned int irq;
 } am335x_mmc_table[AM335X_NUM_MMC] = {
-    { 0x48060000, 64 }, /* MMC0 -> mmcblk0 */
-    { 0x481D8000, 28 }, /* MMC1 -> mmcblk1 */
+    { 0x48060000, 64 }, /* MMC0 -> mmcblk0 (microSD)         */
+    { 0x481D8000, 28 }, /* MMC1 -> mmcblk1 (eMMC)            */
+    { 0x47810000, 29 }, /* MMC2 -> SDIO (wl1835 WiFi on BBGW) */
 };
 
 /* I2C0 MMIO base and INTC input line (TRM spruh73q ch.6/21; DT

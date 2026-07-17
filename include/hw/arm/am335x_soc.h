@@ -40,7 +40,7 @@
 OBJECT_DECLARE_SIMPLE_TYPE(AM335xState, AM335X_SOC)
 
 #define AM335X_NUM_TIMERS 4
-#define AM335X_NUM_MMC    2
+#define AM335X_NUM_MMC    3   /* MMCHS0 (microSD), MMCHS1 (eMMC), MMCHS2 (SDIO) */
 #define AM335X_NUM_GPIO   4
 #define AM335X_NUM_I2C    1   /* I2C0 only; I2C1/I2C2 remain unimplemented */
 
