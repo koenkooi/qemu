@@ -34,6 +34,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "system/runstate.h"
 
 /* --- CLKCTRL offset set (absolute within the 0x44E00000 window) ------- */
 /*
@@ -62,6 +63,18 @@ static const hwaddr am335x_prcm_clkctrl_offsets[] = {
     /* CM_CEFUSE (base 0xA00) */
     0xA20,
 };
+
+/*
+ * PRM_RSTCTRL (PRM_DEVICE_MOD 0xF00 + offset 0x0 -- TRM spruh73q 8.1.4.2 /
+ * kernel arch/arm/mach-omap2/prm33xx.h AM33XX_PRM_RSTCTRL). am33xx_restart()
+ * (mach-omap2/am33xx-restart.c) is the actual `reboot` syscall handler on
+ * this SoC: it writes RST_GLOBAL_WARM_SW (bit0, or COLD_SW bit1 for
+ * REBOOT_COLD) here and never touches WDT1. Without a side effect on this
+ * write the guest reboot request is silently absorbed into the flat store.
+ */
+#define PRCM_RSTCTRL_OFFSET          0xF00
+#define PRCM_RST_GLOBAL_WARM_SW_MASK (1 << 0)
+#define PRCM_RST_GLOBAL_COLD_SW_MASK (1 << 1)
 
 /* --- DPLL IDLEST -> paired CLKMODE offset (absolute) ------------------- */
 struct am335x_prcm_dpll_pair {
@@ -234,6 +247,12 @@ static void am335x_prcm_write(void *opaque, hwaddr addr, uint64_t value,
     }
 
     s->regs[addr >> 2] = (uint32_t)value;
+
+    if (addr == PRCM_RSTCTRL_OFFSET &&
+        (value & (PRCM_RST_GLOBAL_WARM_SW_MASK |
+                  PRCM_RST_GLOBAL_COLD_SW_MASK))) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
 }
 
 static const MemoryRegionOps am335x_prcm_ops = {
