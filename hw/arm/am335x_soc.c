@@ -421,6 +421,12 @@ static void am335x_soc_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cpsw), errp)) {
         return;
     }
+    /*
+     * Mirror the now-finalized NIC MAC address into the Control Module's
+     * mac_id0_lo/hi (see am335x_control.c) so the guest's ti_cm_get_macid()
+     * fallback picks up the real configured MAC instead of a random one.
+     */
+    am335x_control_set_mac_id0(&s->control, s->cpsw.conf.macaddr.a);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->cpsw), 0, AM335X_CPSW_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->cpsw), 0,
                        qdev_get_gpio_in(dev, AM335X_IRQ_CPSW_RXTHR));

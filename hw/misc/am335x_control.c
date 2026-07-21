@@ -23,6 +23,20 @@
  *    the true counter wrap period, so sched_clock saturates at the 32-bit
  *    wrap (~223s) and every printk timestamp freezes there.
  *
+ *  - mac_id0_lo/hi (0x630/0x634, TRM 9.3.1.24/.25) mirror the QEMU-side
+ *    am335x-cpsw device's actual configured MAC address. On real silicon
+ *    these are read-only, factory-EFUSE-programmed registers; the AM335x
+ *    cpsw driver's ti_cm_get_macid() (drivers/net/ethernet/ti/
+ *    cpsw-common.c) reads them via the "syscon" phandle whenever the DT
+ *    has no local-mac-address property (which am335x-bone-common.dtsi
+ *    does not). Before this was modeled, the window's plain flat store
+ *    read back all-zero here, is_valid_ether_addr() rejected it, and the
+ *    driver fell back to eth_random_addr() -- so the guest's eth0 had a
+ *    random MAC (a2:...) instead of the one QEMU actually configured for
+ *    the netdev (e.g. via -device am335x-cpsw.0,mac=...). See
+ *    am335x_control_set_mac_id0(), called from am335x_soc.c once the CPSW
+ *    device has realized (and thus finalized its MAC address).
+ *
  * DEVICE_ID (0x600), the JTAG/silicon-revision id, is currently read back
  * from the plain store (0) like the rest of the window; a real value can
  * be added later without affecting the clock behaviour above.
@@ -45,7 +59,9 @@
 #include "qemu/module.h"
 
 /* Register offsets (TRM spruh73q ch.9). */
-#define CONTROL_STATUS  0x040
+#define CONTROL_STATUS      0x040
+#define CONTROL_MAC_ID0_LO  0x630
+#define CONTROL_MAC_ID0_HI  0x634
 
 /*
  * VTP0_CTRL (0xE0C, VTP0_CTRL_ADDR in u-boot arch-am33xx/hardware_am33xx.h).
@@ -96,6 +112,11 @@ static uint64_t am335x_control_read(void *opaque, hwaddr offset, unsigned size)
         }
         return v;
     }
+    case CONTROL_MAC_ID0_LO:
+        return ((uint32_t)s->mac_id0[5] << 8) | s->mac_id0[4];
+    case CONTROL_MAC_ID0_HI:
+        return ((uint32_t)s->mac_id0[3] << 24) | ((uint32_t)s->mac_id0[2] << 16) |
+               ((uint32_t)s->mac_id0[1] << 8) | s->mac_id0[0];
     default:
         return s->regs[offset / 4];
     }
@@ -117,10 +138,19 @@ static void am335x_control_write(void *opaque, hwaddr offset, uint64_t value,
     case CONTROL_STATUS:
         /* read-only status register */
         break;
+    case CONTROL_MAC_ID0_LO:
+    case CONTROL_MAC_ID0_HI:
+        /* read-only, EFUSE-backed on real silicon (TRM 9.3.1.24/.25) */
+        break;
     default:
         s->regs[offset / 4] = (uint32_t)value;
         break;
     }
+}
+
+void am335x_control_set_mac_id0(AM335xControlState *s, const uint8_t *mac)
+{
+    memcpy(s->mac_id0, mac, sizeof(s->mac_id0));
 }
 
 static const MemoryRegionOps am335x_control_ops = {
