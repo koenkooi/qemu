@@ -28,6 +28,7 @@
 #include "qapi/qapi-events-run-state.h"
 #include "system/runstate.h"
 #include "system/watchdog.h"
+#include "block/block-global-state.h"
 #include "hw/nmi.h"
 #include "qemu/help_option.h"
 #include "trace.h"
@@ -59,6 +60,10 @@ void watchdog_perform_action(void)
 
     case WATCHDOG_ACTION_POWEROFF:  /* same as 'quit' command in monitor */
         qapi_event_send_watchdog(WATCHDOG_ACTION_POWEROFF);
+        /* exit(0) bypasses qemu_cleanup()'s block-backend flush; do a
+         * bounded synchronous flush first so guest writes actually land
+         * (see hw/rtc/am335x_rtc.c for the same fix and full reasoning). */
+        bdrv_flush_all();
         exit(0);
 
     case WATCHDOG_ACTION_PAUSE:     /* same as 'stop' command in monitor */

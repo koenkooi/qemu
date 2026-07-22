@@ -67,6 +67,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "migration/vmstate.h"
+#include "block/block-global-state.h"
 #include "qemu/bcd.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -268,6 +269,20 @@ static void am335x_rtc_write(void *opaque, hwaddr offset, uint64_t value,
     case RTC_PMIC:
         s->pmic = v;
         if ((v & RTC_PMIC_POWEROFF_SIG) == RTC_PMIC_POWEROFF_SIG) {
+            /*
+             * exit(0) bypasses qemu_cleanup(), which is normally what
+             * flushes block backends (qcow2's own metadata caches, not
+             * just the guest's OS-level page cache) to disk. Flush
+             * synchronously first so guest writes actually land -- this
+             * is a bounded call, not the async shutdown sequence that
+             * lost the race against mdelay(1500) (see above), so it
+             * doesn't reintroduce that bug. Callable here: MMIO write
+             * callbacks always run on a vCPU thread holding the BQL,
+             * which qemu_in_main_thread() (what GLOBAL_STATE_CODE()
+             * checks) treats as the block layer's main thread for
+             * system emulators.
+             */
+            bdrv_flush_all();
             exit(0);
         }
         break;
