@@ -25,6 +25,32 @@
  * The two interrupt outputs (periodic line 75, alarm line 76) are wired
  * so devm_request_irq() succeeds but are never asserted.
  *
+ * RTC_PMIC (0x98) "system-power-controller" poweroff (drivers/rtc/
+ * rtc-omap.c omap_rtc_power_off(), registered as pm_power_off because the
+ * BeagleBone DT's &rtc has "system-power-controller"): on real hardware
+ * this arms an ALARM2 event ~1s out and sets PMIC_POWER_EN, which drives
+ * an external pin that cuts board power -- omap_rtc_power_off() then
+ * mdelay(1500)s and never returns because the SoC loses power mid-wait.
+ * This model doesn't tick the calendar (see above), so there is no
+ * meaningful "1 second later" to wait for; instead, the write of the
+ * exact bit combination that ONLY omap_rtc_power_off() (not the shared
+ * omap_rtc_power_off_program() helper, also called from the RTC-only
+ * suspend path in drivers/soc/ti/pm33xx.c, which sets just POWER_EN_EN)
+ * produces -- PMIC_POWER_EN_EN | EXT_WKUP_POL(0) | EXT_WKUP_EN(0), bits
+ * {16,4,0} -- is treated as the trigger. Without this, mdelay(1500)
+ * returns normally, kernel_power_off() returns, sys_reboot() falls
+ * through to do_exit(0) on PID 1, and the kernel panics with "Attempted
+ * to kill init!".
+ *
+ * The trigger calls exit(0) directly rather than
+ * qemu_system_powerdown_request(): the latter only sets a flag for the
+ * main loop to notice, which lost the race in testing -- the guest's own
+ * mdelay(1500) busy-wait (no HLT/WFI, so nothing yields) kept running for
+ * >400ms and hit the do_exit(0)/panic path before the async shutdown was
+ * processed. hw/watchdog/watchdog.c's WATCHDOG_ACTION_POWEROFF faces the
+ * identical "must not race with continuing guest execution" problem and
+ * uses the same exit(0) pattern for the same reason.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation; either version 2 or
@@ -91,6 +117,18 @@
 #define RTC_REVISION_VALUE  0x4EB00904
 #define RTC_OSC_VALUE       0x00000010
 #define RTC_SYSCONFIG_VALUE 0x00000002
+
+/*
+ * RTC_PMIC bits (drivers/rtc/rtc-omap.c OMAP_RTC_PMIC_*). The exact
+ * combination omap_rtc_power_off() writes -- POWER_EN_EN plus
+ * EXT_WKUP_POL(0)/EXT_WKUP_EN(0) -- is the poweroff signature; see the
+ * file header.
+ */
+#define RTC_PMIC_POWER_EN_EN     (1u << 16)
+#define RTC_PMIC_EXT_WKUP_POL0   (1u << 4)
+#define RTC_PMIC_EXT_WKUP_EN0    (1u << 0)
+#define RTC_PMIC_POWEROFF_SIG    (RTC_PMIC_POWER_EN_EN | RTC_PMIC_EXT_WKUP_POL0 | \
+                                  RTC_PMIC_EXT_WKUP_EN0)
 
 static uint64_t am335x_rtc_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -229,6 +267,9 @@ static void am335x_rtc_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case RTC_PMIC:
         s->pmic = v;
+        if ((v & RTC_PMIC_POWEROFF_SIG) == RTC_PMIC_POWEROFF_SIG) {
+            exit(0);
+        }
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
